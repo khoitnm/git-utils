@@ -15,6 +15,12 @@ Examples
 
 Credentials are read from a .env file found next to this script (or in any
 parent folder): GIT_PAT (or GITHUB_PAT / GITHUB_TOKEN), JIRA_PAT, JIRA_BASE_URL.
+
+Anything that can make the report wrong is printed on the console: WARNING for
+recoverable trouble, ERROR for problems that probably invalidate the output.
+Errors are repeated in a summary at the end and make the exit code non-zero
+(2 = the run could not start, 1 = the report was produced but has problems).
+Add --debug for the HTTP request log and tracebacks.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ import os
 import re
 import sys
 import time
+import traceback
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -67,6 +75,10 @@ BOILERPLATE_RE = re.compile(
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+PROBLEMS: list[str] = []
+DEBUG = False
+
+
 def log(msg: str, *, quiet: bool = False) -> None:
     """stderr progress output, safe on a legacy (cp1252) Windows console."""
     if quiet:
@@ -76,6 +88,25 @@ def log(msg: str, *, quiet: bool = False) -> None:
     except UnicodeEncodeError:
         encoding = sys.stderr.encoding or "ascii"
         print(msg.encode(encoding, "replace").decode(encoding), file=sys.stderr, flush=True)
+
+
+def warn(msg: str) -> None:
+    """Something went wrong but the report can still be built. Always printed."""
+    log(f"WARNING: {msg}")
+
+
+def problem(msg: str, *, hint: str = "") -> None:
+    """A problem that probably makes the report wrong: printed now, repeated in the
+    summary at the end, and makes the process exit non-zero. Ignores --quiet."""
+    PROBLEMS.append(msg)
+    log(f"ERROR: {msg}")
+    if hint:
+        log(f"  -> {hint}")
+
+
+def debug(msg: str) -> None:
+    if DEBUG:
+        log(f"debug: {msg}")
 
 
 def load_env() -> None:
@@ -148,12 +179,32 @@ def truncate(text: str, limit: int) -> str:
 # --------------------------------------------------------------------------- #
 # GitHub
 # --------------------------------------------------------------------------- #
+DIAG_HEADERS = ("x-ratelimit-remaining", "x-ratelimit-reset", "x-github-sso",
+                "x-accepted-github-permissions", "x-oauth-scopes", "x-github-request-id")
+
+
+class GitHubError(RuntimeError):
+    """A GitHub response we cannot use, with the details needed to explain why."""
+
+    def __init__(self, response: requests.Response, url: str):
+        self.status = response.status_code
+        self.url = url
+        self.body = truncate(response.text, 400)
+        self.headers = {name: response.headers[name]
+                        for name in DIAG_HEADERS if name in response.headers}
+        detail = " ".join(f"{k}={v}" for k, v in self.headers.items())
+        super().__init__(f"GitHub {self.status} for {url}: {self.body}"
+                         + (f" [{detail}]" if detail else ""))
+
+
 class GitHubClient:
     def __init__(self, token: str, api_base: str, *, timeout: int = 30, quiet: bool = False):
         self.api_base = api_base.rstrip("/")
         self.timeout = timeout
         self.quiet = quiet
         self.calls = 0
+        self.last_total_count: int | None = None
+        self.token_login = ""
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/vnd.github+json",
@@ -187,37 +238,62 @@ class GitHubClient:
         if not url.startswith("http"):
             url = f"{self.api_base}{url}"
         last: requests.Response | None = None
+        last_exc: Exception | None = None
         for attempt in range(6):
             self.calls += 1
-            last = self.session.get(url, params=params, timeout=self.timeout)
+            try:
+                last = self.session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_exc = exc
+                warn(f"GitHub request to {url} failed ({exc}); retry {attempt + 1}/6")
+                time.sleep(2 ** attempt)
+                continue
+            debug(f"GET {last.url} -> {last.status_code}")
             if self._rate_limited(last):
                 wait = self._sleep_for(last)
-                log(f"  rate limited by GitHub, sleeping {wait:.0f}s", quiet=self.quiet)
+                warn(f"rate limited by GitHub ({last.status_code}), sleeping {wait:.0f}s "
+                     f"(retry {attempt + 1}/6)")
                 time.sleep(wait)
                 continue
             if last.status_code >= 500:
+                warn(f"GitHub {last.status_code} for {url}; retry {attempt + 1}/6")
                 time.sleep(2 ** attempt)
                 continue
             return last
-        return last  # type: ignore[return-value]
+        if last is None:
+            raise RuntimeError(f"GitHub unreachable: {url} ({last_exc})")
+        raise GitHubError(last, url)  # exhausted retries on 5xx / rate limit
 
     def get(self, url: str, params: dict | None = None) -> Any:
         response = self.request(url, params)
         if not response.ok:
-            raise RuntimeError(f"GitHub {response.status_code} for {url}: {truncate(response.text, 300)}")
-        return response.json()
+            raise GitHubError(response, url)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"GitHub returned non-JSON for {url}: {exc}: "
+                               f"{truncate(response.text, 200)}") from exc
 
     def paginate(self, path: str, params: dict | None = None, *, key: str | None = None,
                  max_items: int | None = None) -> Iterator[dict]:
         query: dict | None = dict(params or {})
         query.setdefault("per_page", 100)
         url, sent = path, 0
+        self.last_total_count = None
         while url:
             response = self.request(url, query)
             if not response.ok:
-                raise RuntimeError(f"GitHub {response.status_code} for {url}: {truncate(response.text, 300)}")
+                raise GitHubError(response, url)
             payload = response.json()
+            if isinstance(payload, dict) and "total_count" in payload:
+                self.last_total_count = payload.get("total_count")
+                if payload.get("incomplete_results"):
+                    warn(f"GitHub search timed out and returned incomplete results for {url} "
+                         f"- the counts below are lower than reality")
             items = payload.get(key, []) if key else payload
+            if key and isinstance(payload, dict) and key not in payload:
+                raise RuntimeError(f"GitHub response for {url} has no {key!r} field: "
+                                   f"{truncate(response.text, 200)}")
             for item in items:
                 yield item
                 sent += 1
@@ -296,6 +372,7 @@ class JiraClient:
         self.timeout = timeout
         self.quiet = quiet
         self.cache: dict[str, dict[str, str]] = {}
+        self.reported: set[str] = set()
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json",
                                      "User-Agent": "github-pr-jira-report"})
@@ -316,8 +393,14 @@ class JiraClient:
             )
             if response.status_code == 404:
                 info["status"] = "NOT_FOUND"
+                warn(f"jira {key}: not found (moved, deleted, or a false-positive key)")
             elif response.status_code in (401, 403):
                 info["status"] = "NO_ACCESS"
+                self._report_once(
+                    f"jira rejected the credentials with HTTP {response.status_code} "
+                    f"(first seen on {key}): all ticket details will be blank",
+                    hint="check JIRA_PAT / JIRA_BASE_URL, and set JIRA_EMAIL too if this is "
+                         "Atlassian Cloud")
             elif response.ok:
                 fields = response.json().get("fields", {})
                 info = {
@@ -327,11 +410,21 @@ class JiraClient:
                 }
             else:
                 info["status"] = f"HTTP_{response.status_code}"
+                self._report_once(f"jira returned HTTP {response.status_code} for {key}: "
+                                  f"{truncate(response.text, 200)}")
         except requests.RequestException as exc:
-            log(f"  jira lookup failed for {key}: {exc}", quiet=self.quiet)
+            self._report_once(f"jira is unreachable at {self.base_url} ({exc}): "
+                              f"ticket details will be blank")
             info["status"] = "ERROR"
         self.cache[key] = info
         return info
+
+    def _report_once(self, message: str, *, hint: str = "") -> None:
+        """One error per failure kind, not one per ticket."""
+        kind = message.split(":")[0]
+        if kind not in self.reported:
+            self.reported.add(kind)
+            problem(message, hint=hint)
 
 
 # --------------------------------------------------------------------------- #
@@ -420,14 +513,14 @@ class Summarizer:
             try:
                 import anthropic
             except ImportError:
-                log("anthropic SDK not installed (pip install anthropic); using heuristic summaries")
+                warn("anthropic SDK not installed (pip install anthropic); using heuristic summaries")
                 self.mode = "heuristic"
                 return
             key = env_first("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
             try:
                 self.client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
             except Exception as exc:  # noqa: BLE001 - any init failure degrades gracefully
-                log(f"anthropic client unavailable ({exc}); using heuristic summaries")
+                warn(f"anthropic client unavailable ({exc}); using heuristic summaries")
                 self.mode = "heuristic"
 
     def summarize(self, pr: dict) -> tuple[str, str]:
@@ -452,13 +545,90 @@ class Summarizer:
 
     def _warn(self, message: str) -> None:
         if not self.warned:
-            log(message)
+            warn(message)
             self.warned = True
 
 
 # --------------------------------------------------------------------------- #
 # discovery
 # --------------------------------------------------------------------------- #
+def preflight(gh: GitHubClient, args: argparse.Namespace, owner: str, repo: str) -> None:
+    """Check token, repo and author before searching so a misconfiguration is
+    reported as an error instead of showing up as an empty report."""
+    response = gh.request(f"/repos/{owner}/{repo}")
+    if not response.ok:
+        raise GitHubError(response, f"/repos/{owner}/{repo}")
+    info = response.json()
+    scopes = response.headers.get("X-OAuth-Scopes")
+    log(f"repo ok: {info.get('full_name')} (private={info.get('private')}, "
+        f"archived={info.get('archived')}) | token scopes: "
+        f"{scopes if scopes else 'none reported (fine-grained token?)'} | "
+        f"rate limit left: {response.headers.get('X-RateLimit-Remaining', '?')}", quiet=args.quiet)
+    if response.headers.get("X-GitHub-SSO"):
+        problem(f"the token is not SSO-authorized for this org: "
+                f"{response.headers['X-GitHub-SSO']}",
+                hint="authorize the PAT for the org under GitHub > Settings > Developer settings > "
+                     "Personal access tokens > Configure SSO")
+
+    try:
+        me = gh.get("/user")
+        gh.token_login = me.get("login") or ""
+        log(f"token user: {gh.token_login}", quiet=args.quiet)
+    except RuntimeError as exc:
+        warn(f"cannot read the token owner (/user): {exc}")
+
+    try:
+        user = gh.get(f"/users/{args.author}")
+        if (user.get("login") or "").lower() != args.author.lower():
+            warn(f"--author {args.author!r} resolves to login {user.get('login')!r}; "
+                 f"using the exact login is safer")
+        log(f"author ok: {user.get('login')} ({user.get('type')})", quiet=args.quiet)
+    except GitHubError as exc:
+        if exc.status == 404:
+            problem(f"GitHub user {args.author!r} does not exist (or is invisible to this token)",
+                    hint="--author must be the GitHub login, not an email address or AD id; "
+                         f"check https://github.com/{args.author}")
+        else:
+            problem(f"cannot verify --author {args.author!r}: {exc}")
+
+
+def diagnose_no_results(gh: GitHubClient, args: argparse.Namespace, owner: str, repo: str) -> None:
+    """Nothing matched: prove whether the repo has PRs at all and, if it does,
+    show who authored the recent ones so the real problem is visible."""
+    log("nothing matched - checking whether the repo has PRs at all", quiet=args.quiet)
+    try:
+        recent = list(gh.paginate(f"/repos/{owner}/{repo}/pulls",
+                                  {"state": "all", "sort": "created", "direction": "desc"},
+                                  max_items=100))
+    except RuntimeError as exc:
+        problem(f"cannot list the PRs of {owner}/{repo} directly either: {exc}",
+                hint="the token cannot read pull requests: a fine-grained PAT needs "
+                     "'Pull requests: read' and 'Contents: read' on this repo")
+        return
+
+    if not recent:
+        log(f"  {owner}/{repo} really has no pull requests - nothing to report", quiet=args.quiet)
+        return
+
+    newest = recent[0]
+    counts = Counter((pr.get("user") or {}).get("login") or "?" for pr in recent)
+    problem(f"the searches returned 0 results, but {owner}/{repo} does have PRs "
+            f"(newest: #{newest.get('number')} by "
+            f"{(newest.get('user') or {}).get('login')} created {iso_date(newest.get('created_at'))})")
+    log("  authors of the " + f"{len(recent)} most recent PRs: "
+        + ", ".join(f"{login}({n})" for login, n in counts.most_common(15)))
+    near = [login for login in counts
+            if args.author.lower() in login.lower() or login.lower() in args.author.lower()]
+    if gh.token_login in counts and gh.token_login.lower() != args.author.lower():
+        near.insert(0, gh.token_login)  # the token owner authored PRs here: almost certainly them
+    if near:
+        log(f"  -> did you mean --author {near[0]} ? "
+            f"(--author takes the GitHub login, not the corporate/AD username)")
+    else:
+        log(f"  -> no recent PR is authored by {args.author!r}. Check the login spelling, "
+            f"--days ({args.days}), --date-field ({args.date_field}) and --state ({args.state})")
+
+
 def discover(gh: GitHubClient, args: argparse.Namespace, owner: str, repo: str, since: str) -> dict[int, dict]:
     """-> {pr_number: pr json enriched with _commits and _reasons}"""
     prs: dict[int, dict] = {}
@@ -467,27 +637,55 @@ def discover(gh: GitHubClient, args: argparse.Namespace, owner: str, repo: str, 
     if args.match in ("author", "both"):
         query = f"repo:{owner}/{repo} type:pr author:{args.author} {args.date_field}:>={since}"
         log(f"searching PRs opened by {args.author} ({args.date_field} >= {since})", quiet=args.quiet)
-        numbers = [item["number"] for item in gh.paginate(
-            "/search/issues", {"q": query, "sort": "created", "order": "desc"},
-            key="items", max_items=SEARCH_RESULT_CAP)]
-        log(f"  {len(numbers)} PR(s) opened by {args.author}", quiet=args.quiet)
+        debug(f"pr search query: {query}")
+        try:
+            numbers = [item["number"] for item in gh.paginate(
+                "/search/issues", {"q": query, "sort": "created", "order": "desc"},
+                key="items", max_items=SEARCH_RESULT_CAP)]
+        except GitHubError as exc:
+            if exc.status == 422:
+                problem(f"GitHub rejected the PR search query {query!r}: {exc.body}",
+                        hint="a 422 here usually means the --author login does not exist or is "
+                             "not visible to this token")
+            else:
+                problem(f"PR search failed: {exc}")
+            numbers = []
+        except RuntimeError as exc:
+            problem(f"PR search failed: {exc}")
+            numbers = []
+        total = gh.last_total_count
+        log(f"  {len(numbers)} PR(s) opened by {args.author}"
+            + (f" (search total_count={total})" if total is not None else ""), quiet=args.quiet)
+        if total is not None and total > SEARCH_RESULT_CAP:
+            warn(f"the PR search matched {total} PRs but the GitHub search API only returns "
+                 f"{SEARCH_RESULT_CAP}: narrow --days to see them all")
         for index, number in enumerate(numbers, 1):
             if args.limit and len(prs) >= args.limit:
                 break
             log(f"  [{index}/{len(numbers)}] loading PR #{number}", quiet=args.quiet)
-            prs[number] = fetch_pr(gh, owner, repo, number)
+            try:
+                prs[number] = fetch_pr(gh, owner, repo, number)
+            except RuntimeError as exc:
+                problem(f"cannot load PR #{number}: {exc}")
+                continue
             reasons.setdefault(number, set()).add("pr-author")
 
     if args.match in ("commits", "both"):
         sha_owner = {c["sha"]: number for number, pr in prs.items() for c in pr["_commits"]}
         query = f"repo:{owner}/{repo} author:{args.author} author-date:>={since}"
         log(f"searching commits authored by {args.author} since {since}", quiet=args.quiet)
+        debug(f"commit search query: {query}")
         try:
             shas = [item["sha"] for item in gh.paginate(
                 "/search/commits", {"q": query, "sort": "author-date", "order": "desc"},
                 key="items", max_items=SEARCH_RESULT_CAP)]
+        except GitHubError as exc:
+            problem(f"commit search failed: {exc}",
+                    hint="/search/commits needs a token that can read the repo contents; "
+                         "a 422 usually means the --author login is unknown to GitHub")
+            shas = []
         except RuntimeError as exc:
-            log(f"  commit search unavailable: {exc}", quiet=args.quiet)
+            problem(f"commit search failed: {exc}")
             shas = []
         orphans = []
         for sha in shas:
@@ -495,14 +693,17 @@ def discover(gh: GitHubClient, args: argparse.Namespace, owner: str, repo: str, 
                 reasons.setdefault(sha_owner[sha], set()).add("commit-author")
             else:
                 orphans.append(sha)
-        log(f"  {len(shas)} commit(s), {len(orphans)} not in the PRs found so far", quiet=args.quiet)
+        total = gh.last_total_count
+        log(f"  {len(shas)} commit(s)"
+            + (f" (search total_count={total})" if total is not None else "")
+            + f", {len(orphans)} not in the PRs found so far", quiet=args.quiet)
         for index, sha in enumerate(orphans, 1):
             if args.limit and len(prs) >= args.limit:
                 break
             try:
                 linked = gh.get(f"/repos/{owner}/{repo}/commits/{sha}/pulls")
             except RuntimeError as exc:
-                log(f"  {sha[:8]}: {exc}", quiet=args.quiet)
+                warn(f"cannot resolve commit {sha[:8]} to a PR: {exc}")
                 continue
             for item in linked:
                 number = item["number"]
@@ -510,11 +711,17 @@ def discover(gh: GitHubClient, args: argparse.Namespace, owner: str, repo: str, 
                     reasons.setdefault(number, set()).add("commit-author")
                     continue
                 log(f"  [{index}/{len(orphans)}] {sha[:8]} -> PR #{number}", quiet=args.quiet)
-                prs[number] = fetch_pr(gh, owner, repo, number)
+                try:
+                    prs[number] = fetch_pr(gh, owner, repo, number)
+                except RuntimeError as exc:
+                    problem(f"cannot load PR #{number}: {exc}")
+                    continue
                 reasons.setdefault(number, set()).add("commit-author")
 
     for number, pr in prs.items():
         pr["_reasons"] = sorted(reasons.get(number, set()))
+    if not prs:
+        diagnose_no_results(gh, args, owner, repo)
     return prs
 
 
@@ -524,13 +731,16 @@ def build_rows(prs: dict[int, dict], args: argparse.Namespace, aliases: set[str]
     project_keys = ({k.strip().upper() for k in args.project_keys.split(",") if k.strip()}
                     if args.project_keys else None)
     rows: list[dict] = []
+    dropped: Counter[str] = Counter()
 
     for number, pr in sorted(prs.items(), reverse=True):
         commits = pr["_commits"]
         mine = [c for c in commits if commit_matches_author(c, aliases)]
         if not mine and "pr-author" not in pr["_reasons"]:
+            dropped["no commit matched the author aliases"] += 1
             continue
         if args.only_author_commits and not mine:
+            dropped["--only-author-commits and no commit of their own"] += 1
             continue
 
         # In the window if the PR date is, or if one of the author's own commits is:
@@ -538,10 +748,12 @@ def build_rows(prs: dict[int, dict], args: argparse.Namespace, aliases: set[str]
         pr_date = iso_date(pr_window_date(pr, args.date_field))
         mine_dates = sorted(iso_date(((c.get("commit") or {}).get("author") or {}).get("date")) for c in mine)
         if not (pr_date >= since or (mine_dates and mine_dates[-1] >= since)):
+            dropped[f"{args.date_field} date outside the --days window"] += 1
             continue
 
         state = state_of(pr)
         if args.state != "all" and state != args.state:
+            dropped[f"state is not --state {args.state}"] += 1
             continue
 
         branch = (pr.get("head") or {}).get("ref") or ""
@@ -590,6 +802,14 @@ def build_rows(prs: dict[int, dict], args: argparse.Namespace, aliases: set[str]
             "summary_200": summary,
             "summary_source": summary_source,
         })
+
+    if dropped:
+        log("filtered out " + ", ".join(f"{n} PR(s): {why}" for why, n in dropped.most_common()),
+            quiet=args.quiet)
+    if prs and not rows:
+        problem(f"found {len(prs)} PR(s) for {args.author} but every one was filtered out",
+                hint="loosen the filters above (--days / --date-field / --state / "
+                     "--only-author-commits) or add --alias for the name/email used in the commits")
     return rows
 
 
@@ -642,22 +862,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--explode-tickets", action="store_true", help="one row per JIRA ticket instead of per PR")
     parser.add_argument("--out", default="", help="output CSV path (default: reports/<repo>_<author>_<date>.csv)")
     parser.add_argument("--limit", type=int, default=0, help="stop after N PRs (for testing)")
-    parser.add_argument("--quiet", action="store_true", help="suppress progress output")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress progress output (warnings and errors are still printed)")
+    parser.add_argument("--debug", action="store_true",
+                        help="log every HTTP request and print tracebacks")
     return parser.parse_args(argv)
 
 
-def err(message: str) -> int:
-    log(f"error: {message}")
+def err(message: str, *, hint: str = "") -> int:
+    log(f"ERROR: {message}")
+    if hint:
+        log(f"  -> {hint}")
     return 2
 
 
-def main(argv: list[str] | None = None) -> int:
+def run(argv: list[str] | None = None) -> int:
+    global DEBUG
     args = parse_args(argv)
+    DEBUG = args.debug
     load_env()
 
     token = env_first("GIT_PAT", "GITHUB_PAT", "GITHUB_TOKEN", "GH_TOKEN")
     if not token:
-        return err("No GitHub token found. Set GIT_PAT (or GITHUB_PAT) in .env")
+        return err("no GitHub token found",
+                   hint="set GIT_PAT (or GITHUB_PAT / GITHUB_TOKEN) in a .env file next to "
+                        f"{SCRIPT_DIR}\\{Path(__file__).name} or in the environment")
 
     owner, repo, api_base, web_base = parse_repo(args.repo_url)
     since = (datetime.now(timezone.utc) - timedelta(days=args.days)).strftime("%Y-%m-%d")
@@ -665,9 +894,18 @@ def main(argv: list[str] | None = None) -> int:
 
     gh = GitHubClient(token, api_base, quiet=args.quiet)
     try:
-        gh.get(f"/repos/{owner}/{repo}")
+        preflight(gh, args, owner, repo)
+    except GitHubError as exc:
+        hints = {
+            401: "the token is invalid or expired",
+            403: "the token cannot read this repo: check the org's SSO authorization and, for a "
+                 "fine-grained PAT, 'Pull requests: read' + 'Contents: read'",
+            404: "either the repo does not exist under that name, or the token cannot see it "
+                 "(private repo without access, or missing SSO authorization)",
+        }
+        return err(f"cannot read {owner}/{repo}: {exc}", hint=hints.get(exc.status, ""))
     except RuntimeError as exc:
-        return err(f"Cannot read {owner}/{repo}: {exc}")
+        return err(f"cannot reach {api_base}: {exc}")
 
     jira_base = (args.jira_base_url or env_first("JIRA_BASE_URL")).rstrip("/")
     jira_token = env_first("JIRA_PAT", "JIRA_TOKEN", "JIRA_API_TOKEN")
@@ -676,9 +914,11 @@ def main(argv: list[str] | None = None) -> int:
         if jira_base and jira_token:
             jira = JiraClient(jira_base, jira_token, email=env_first("JIRA_EMAIL"), quiet=args.quiet)
         elif not jira_base:
-            log("JIRA_BASE_URL not set: ticket links and details will be blank", quiet=args.quiet)
+            warn("JIRA_BASE_URL not set: ticket links and details will be blank "
+                 "(pass --no-jira to silence this)")
         else:
-            log("JIRA_PAT not set: ticket links only, no summary/status", quiet=args.quiet)
+            warn("JIRA_PAT not set: ticket links only, no summary/status "
+                 "(pass --no-jira to silence this)")
 
     summarizer = Summarizer(args)
 
@@ -689,20 +929,51 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = Path(args.out) if args.out else (
         SCRIPT_DIR / "reports" / f"{owner}-{repo}_{args.author}_{datetime.now():%Y%m%d}.csv")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0].keys()) if rows else ["jira_tickets", "pr_number", "pr_url"]
-    with out_path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as exc:
+        return err(f"cannot write {out_path}: {exc}",
+                   hint="close the file if it is open in Excel, or pass a different --out path")
 
     tickets = {k.strip() for row in pr_rows for k in row["jira_tickets"].split(",") if k.strip()}
     commits = sum(int(row["commits_by_author"] or 0) for row in pr_rows)
     log("", quiet=args.quiet)
     log(f"PRs: {len(pr_rows)} | rows: {len(rows)} | distinct JIRA tickets: {len(tickets)} | "
         f"commits by {args.author}: {commits} | GitHub API calls: {gh.calls}", quiet=args.quiet)
+    if not rows:
+        log(f"the report is EMPTY: {out_path} contains headers only")
+
+    if PROBLEMS:
+        log("")
+        log(f"{len(PROBLEMS)} problem(s) detected during this run:")
+        for index, message in enumerate(PROBLEMS, 1):
+            log(f"  {index}. {message}")
     print(out_path)
-    return 0
+    return 1 if PROBLEMS else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Wraps run() so no failure can end as a bare traceback with no explanation."""
+    try:
+        return run(argv)
+    except KeyboardInterrupt:
+        log("interrupted")
+        return 130
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report anything unexpected, then exit non-zero
+        log("")
+        log(f"ERROR: unexpected failure: {type(exc).__name__}: {exc}")
+        if DEBUG:
+            traceback.print_exc()
+        else:
+            log("  -> re-run with --debug for the traceback and the HTTP request log")
+        return 2
 
 
 if __name__ == "__main__":
