@@ -90,13 +90,28 @@ file is named after the first name given.
 
 ### Columns
 
-`jira_tickets`, `jira_links`, `jira_summaries`, `jira_statuses`, `jira_types`,
-`ticket_source` (title / branch / commit-message), `pr_number`, `pr_title`,
-`pr_url`, `branch`, `merge_kind` (merge / squash), `merged_date`, `merged_by`,
-`authors`, `commits_total`, `commits_by_author`, `first_commit_date`,
-`last_commit_date`, `summary` (never empty), `summary_source`, `merge_sha`.
+The six you actually read come first:
 
-The CSV is written as UTF-8 with BOM so Excel opens it correctly.
+`summary` (never empty), `jira_summaries`, `pr_title`, `branch`, `merged_date`,
+`commits_by_author`
+
+then the provenance:
+
+`jira_links`, `ticket_source` (title / branch / commit-message), `pr_url`,
+`merged_by`, `authors`, `first_commit_date`, `last_commit_date`,
+`summary_source`, `merge_sha`
+
+and the JIRA field dumps last, where they stay out of the way:
+
+`jira_statuses`, `jira_types`
+
+`--explode-tickets` swaps the aggregate `jira_summaries` column for a per-ticket
+`jira_summary` / `jira_ticket` / `jira_link`, and `jira_statuses` / `jira_types`
+for the single-value `jira_status` / `jira_type`, keeping the same lead order.
+
+The order lives in `LEAD_FIELDS` / `REST_FIELDS` at the top of the script — edit
+those to rearrange. The CSV is written as UTF-8 with BOM so Excel opens it
+correctly.
 
 ## How PRs are found
 

@@ -97,12 +97,14 @@ BOILERPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-ROW_FIELDS = [
-    "jira_tickets", "jira_links", "jira_summaries", "jira_statuses", "jira_types",
-    "ticket_source", "pr_number", "pr_title", "pr_url", "branch", "merge_kind",
-    "merged_date", "merged_by", "authors", "commits_total", "commits_by_author",
-    "first_commit_date", "last_commit_date", "summary", "summary_source", "merge_sha",
-]
+# CSV column order. The lead columns are the ones you actually read in Excel;
+# everything else is provenance kept to the right of them.
+LEAD_FIELDS = ["summary", "jira_summaries", "pr_title", "branch", "merged_date",
+               "commits_by_author"]
+REST_FIELDS = ["jira_links", "ticket_source", "pr_url", "merged_by", "authors",
+               "first_commit_date", "last_commit_date", "summary_source", "merge_sha",
+               "jira_statuses", "jira_types"]
+ROW_FIELDS = LEAD_FIELDS + REST_FIELDS
 
 
 # --------------------------------------------------------------------------- #
@@ -874,21 +876,17 @@ def build_rows(prs: list[dict], args: argparse.Namespace, jira: JiraClient | Non
         url = (f"{web_base}/{args.owner}/{args.repo}/pull/{pr['number']}"
                if web_base and args.owner and args.repo else "")
         rows.append({
-            "jira_tickets": ", ".join(tickets),
             "jira_links": " ".join(f"{jira_base}/browse/{k}" for k in tickets) if jira_base else "",
             "jira_summaries": " | ".join(details[k]["summary"] for k in tickets if details[k]["summary"]),
             "jira_statuses": ", ".join(f"{k}={details[k]['status']}" for k in tickets if details[k]["status"]),
             "jira_types": ", ".join(f"{k}={details[k]['type']}" for k in tickets if details[k]["type"]),
             "ticket_source": ", ".join(sorted(set(tickets.values()))),
-            "pr_number": pr["number"],
             "pr_title": pr["title"],
             "pr_url": url,
             "branch": pr["branch"],
-            "merge_kind": pr["kind"],
             "merged_date": pr["merged_date"],
             "merged_by": pr["merged_by"],
             "authors": "; ".join(pr["authors"]),
-            "commits_total": len(pr["commits"]),
             "commits_by_author": pr["commits_by_author"],
             "first_commit_date": pr["first_commit_date"],
             "last_commit_date": pr["last_commit_date"],
@@ -904,7 +902,7 @@ def explode(rows: list[dict], jira_base: str) -> list[dict]:
     """One row per JIRA ticket; PRs without a ticket keep a single blank-ticket row."""
     out: list[dict] = []
     for row in rows:
-        keys = [k.strip() for k in row["jira_tickets"].split(",") if k.strip()] or [""]
+        keys = list(row["_details"]) or [""]
         for key in keys:
             info = row["_details"].get(key, BLANK_ISSUE)
             out.append({
@@ -914,18 +912,24 @@ def explode(rows: list[dict], jira_base: str) -> list[dict]:
                 "jira_status": info["status"],
                 "jira_type": info["type"],
                 **{k: v for k, v in row.items()
-                   if k not in ("jira_tickets", "jira_links", "jira_summaries",
+                   if k not in ("jira_links", "jira_summaries",
                                 "jira_statuses", "jira_types")},
             })
     return out
 
 
-EXPLODED_FIELDS = (["jira_ticket", "jira_link", "jira_summary", "jira_status", "jira_type"]
-                   + [f for f in ROW_FIELDS if not f.startswith("jira_")])
+EXPLODED_FIELDS = (["summary", "jira_summary", "pr_title", "branch", "merged_date",
+                    "commits_by_author", "jira_ticket", "jira_link"]
+                   + [f for f in REST_FIELDS if not f.startswith("jira_")]
+                   + ["jira_status", "jira_type"])
 
 
-def write_csv(rows: list[dict], out_path: Path, fallback_fields: list[str]) -> None:
-    fieldnames = [f for f in (rows[0] if rows else fallback_fields) if not f.startswith("_")]
+def write_csv(rows: list[dict], out_path: Path, fieldnames: list[str]) -> None:
+    present = {key for row in rows for key in row if not key.startswith("_")}
+    extra = sorted(present - set(fieldnames))
+    if extra:  # a new row key would otherwise be dropped silently
+        warn(f"column(s) not in the CSV layout, appended at the end: {', '.join(extra)}")
+        fieldnames = fieldnames + extra
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -1123,7 +1127,7 @@ def run(argv: list[str] | None = None) -> int:
                    hint="close the file if it is open in Excel, or pass a different --out path")
 
     tickets = {k for row in pr_rows for k in row["_details"]}
-    with_ticket = sum(1 for row in pr_rows if row["jira_tickets"])
+    with_ticket = sum(1 for row in pr_rows if row["_details"])
     sources = Counter(row["summary_source"].split(":")[0] for row in pr_rows)
     blank = sum(1 for row in pr_rows if not row["summary"].strip())
     commits_mine = sum(int(row["commits_by_author"] or 0) for row in pr_rows)
