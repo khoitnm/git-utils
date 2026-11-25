@@ -50,6 +50,12 @@ Searches over 1000 results are split by date automatically.
   batched requests ≈ 5 minutes), cached in `.cache/` for 7 days. Members with no PR
   activity at all are left out. `--baseline-sample N` uses N random members, and
   `--no-baseline` skips the step.
+* **New joiners**: when a person's GitHub account was created more than 14 days into the
+  window (enterprise accounts are created on joining), everything is compared over
+  *their* window only: the org baseline is counted from their join date for the members who
+  were already in the company by then, and cohort peers are re-measured over the same days
+  from their raw data. Everyone else is compared with the members who were there for the
+  whole window.
 * **Score** = the percentile turned so that 100 is always the good end (lower cycle time
   is better, more reviews is better). Group scores are the average over a group.
   Context-only metrics (lines added, weekend share, ...) are shown but never scored.
@@ -66,10 +72,58 @@ Searches over 1000 results are split by date automatically.
 
 Full definitions are in `METRIC_DEFS` in the script and at the bottom of every report.
 
+## What kind of work (`pr_classify.py`)
+
+Every PR is classified twice, by rules you can tune in `pr_classify.py`:
+
+* **Area**, from its changed files. Each file goes to the first matching area: AI & agent
+  tooling, Dependencies & build, CI/CD pipelines, Scheduled jobs, Infrastructure, Database,
+  Tests, APIs, Docs, Support tools & scripts, Frontend, Configuration, Backend. The PR's main
+  area is the one with the most changed lines. Lock files count as only a few lines, and
+  tests, docs and config give way to any real code area that has at least 10% of the lines.
+* **Change type**, from a conventional-commit prefix, then the title, then the branch name,
+  then the files: Feature, Enhancement, Bug fix, Performance, Refactor & cleanup,
+  Dependency & platform upgrade, Tooling & AI, Tests, Docs, CI/CD & build, Configuration,
+  Release & merge, Revert, Product change.
+
+The report shows, per area and per type: PRs, PRs touching the area, line share, merged,
+lines added / deleted, median size, median time to merge, repos, and share with tests. It
+also shows area by month, type × area, the most-changed directories, file types, and the
+areas and types of the PRs the person reviews. GitHub returns the first 100 files of a PR
+(60 for reviewed PRs), so very large PRs are classified from those.
+
+## Stored data and versions
+
+The raw data of every person is kept in `.cache/people/<org>/<login>.json` (gitignored),
+tagged with `data_version` and the date ranges it covers. On the next run with the same
+`DATA_VERSION`, the script fetches only:
+
+* the days of the requested window that the store does not cover yet;
+* the last 14 days before the previous fetch (`REFRESH_DAYS`), because PRs merge and get
+  reviewed after they are first seen;
+* still-open PRs from earlier fetches, by ID, to pick up merges and closes.
+
+Profile and the 5 search counts are always fetched (2 calls). A same-day rerun therefore
+costs a handful of calls instead of dozens. `--refresh-data` ignores the store.
+
+Metrics and PR classification are recomputed from the raw data on every run, so changes to
+`pr_classify.py` or the metrics need no new fetch. Bump `DATA_VERSION` in the script only
+when the GraphQL fields or the stored layout change: stores with another version are then
+fetched again from scratch. Org baselines have their own `BASELINE_VERSION` and a 7-day cache.
+
+Every JSON file and the report folder name carry the data version.
+
+## Cost
+
+The report ends with a **Run cost** section: GitHub API calls (total and per person), which
+date ranges were fetched and which came from the store, and AI usage. No AI model is used,
+because PR classification is rule-based, so tokens and cost are always 0. The fields are
+in `manifest.json` → `run_cost`.
+
 ## Output
 
 ```
-reports/github-performance/<stamp>/      (gitignored)
+reports/github-performance/<stamp>_v<DATA_VERSION>/      (gitignored)
   index.html                 copy of report_template.html
   data/manifest.json         window, people, files, problems
   data/summary.json          metric definitions, metrics, ranks, scores for everyone

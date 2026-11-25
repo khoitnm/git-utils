@@ -8,7 +8,7 @@
   Template for github_performance.py. It is copied next to the JSON it renders:
     data/manifest.json      - what the run contains
     data/summary.json       - metric definitions, every person's metrics, ranks and scores
-    data/org_baseline.json  - anonymous org-wide distributions (optional)
+    data/org_baseline*.json - anonymous org-wide distributions, one per comparison window (optional)
     data/users/<login>.json - raw per-person data: PRs, reviews, commits, calendar, chart series
   Browsers block fetch() from file://, so open it through the script's local server
   (python github_performance.py --view <report folder>).
@@ -167,7 +167,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const SVGNS = "http://www.w3.org/2000/svg";
-const state = { manifest: null, summary: null, baseline: null, users: {}, defs: {}, current: null, prSort: {key: "createdAt", asc: false} };
+const state = { manifest: null, summary: null, baselines: {}, users: {}, defs: {}, current: null, prSort: {key: "createdAt", asc: false} };
 
 function fmt(v, unit) {
   if (v === null || v === undefined || Number.isNaN(v)) return "–";
@@ -291,13 +291,18 @@ function calendar(el, days) {
   el.appendChild(lg);
 }
 
+const baselineFor = p => state.baselines[p.comparison?.org_file] || null;
+const joinedLate = p => p.comparison && p.comparison.from !== state.summary.from;
+const windowText = p => `${date10(p.comparison.from)} \u2192 ${date10(p.comparison.to)} (${p.comparison.days} days)`;
+
 // person's value against the org distribution: IQR band, median tick, p90 tick, person dot
 function orgStrip(el, metrics, person) {
-  const rows = metrics.filter(d => state.baseline?.metrics?.[d.key]);
+  const base = baselineFor(person);
+  const rows = metrics.filter(d => base?.metrics?.[d.key]);
   if (!rows.length) { el.innerHTML = `<p class="empty">No organisation baseline in this report (run without --no-baseline).</p>`; return; }
   el.innerHTML = "";
   for (const d of rows) {
-    const b = state.baseline.metrics[d.key], r = person.ranks[d.key] || {};
+    const b = base.metrics[d.key], r = person.ranks[d.key] || {};
     const value = r.org_value ?? person.metrics[d.key];
     const vals = b.values, p95 = vals[Math.floor((vals.length - 1) * 0.95)];
     const max = Math.max(p95, value ?? 0, b.p90, 1) * 1.05;
@@ -306,7 +311,7 @@ function orgStrip(el, metrics, person) {
     row.className = "strip-row";
     row.innerHTML = `
       <div><div>${esc(d.label)}</div><div class="muted" style="font-size:12px">org median ${fmt(b.median, d.unit)}</div></div>
-      <div style="position:relative;height:26px" data-tip="${esc(`${d.label}\n${person.login}: ${fmt(value, d.unit)} (${fmtPct(r.org_pct)} of ${state.baseline.active_members} active members)\norg p25 ${fmt(b.p25, d.unit)} · median ${fmt(b.median, d.unit)} · p75 ${fmt(b.p75, d.unit)} · p90 ${fmt(b.p90, d.unit)} · max ${fmt(b.max, d.unit)}`)}">
+      <div style="position:relative;height:26px" data-tip="${esc(`${d.label}\n${person.login}: ${fmt(value, d.unit)} (${fmtPct(r.org_pct)} of ${base.active_members} active members)\norg p25 ${fmt(b.p25, d.unit)} · median ${fmt(b.median, d.unit)} · p75 ${fmt(b.p75, d.unit)} · p90 ${fmt(b.p90, d.unit)} · max ${fmt(b.max, d.unit)}`)}">
         <div style="position:absolute;left:0;right:0;top:12px;height:2px;background:var(--grid)"></div>
         <div style="position:absolute;left:${pos(b.p25)};width:calc(${pos(b.p75)} - ${pos(b.p25)});top:7px;height:12px;background:var(--band);border-radius:3px"></div>
         <div style="position:absolute;left:${pos(b.median)};top:4px;width:2px;height:18px;background:var(--text-secondary)"></div>
@@ -322,7 +327,7 @@ function orgStrip(el, metrics, person) {
   lg.innerHTML = `<span><span class="sw" style="background:var(--series-1);border-radius:50%"></span>${esc(person.login)}</span>
     <span><span class="sw" style="background:var(--band)"></span>middle 50% of the org (p25-p75)</span>
     <span><span class="sw" style="background:var(--text-secondary);width:2px"></span>median</span>
-    <span class="muted">thin tick = p90 · P = percentile among ${state.baseline.active_members} active members</span>`;
+    <span class="muted">thin tick = p90 · P = percentile among ${base.active_members} active members</span>`;
   el.appendChild(lg);
 }
 
@@ -340,15 +345,17 @@ function renderOverview(el) {
   el.innerHTML = `
     <h2>Overview</h2>
     <p class="sub">Group score = average percentile of that group's metrics, turned so 100 is always the good end and 50 is typical.
-      ${multi ? `Ranked within the ${s.people.length} people in this report.` : `Only one person in the report, so scores use the organisation ranks where they exist.`}
+      ${multi ? `Ranked within the people in this report.` : `Only one person in the report, so scores use the organisation ranks where they exist.`}
+      Someone who joined during the window is ranked over the same days only, against people who were already in the company.
       Click a row to open the person; click a header to sort.</p>
     <div class="scroll"><table id="overview-table">
       <thead><tr><th class="l" data-k="login">Person</th>
+        <th class="l" data-k="window" data-tip="People who joined during the window are compared over the same days only, with members who were already there">Compared over</th>
         ${groups.map(g => `<th data-k="g:${esc(g)}">${esc(g)}</th>`).join("")}
         ${OVERVIEW_COLS.map(k => `<th data-k="${k}" data-tip="${esc(state.defs[k].desc)}">${esc(state.defs[k].label)}</th>`).join("")}
       </tr></thead><tbody></tbody></table></div>`;
   let sortKey = "login", asc = true;
-  const val = (p, k) => k === "login" ? p.login.toLowerCase() : k.startsWith("g:") ? p.group_scores[k.slice(2)] : p.metrics[k];
+  const val = (p, k) => k === "login" ? p.login.toLowerCase() : k === "window" ? p.comparison.days : k.startsWith("g:") ? p.group_scores[k.slice(2)] : p.metrics[k];
   const draw = () => {
     const rows = [...s.people].sort((a, b) => {
       const x = val(a, sortKey), y = val(b, sortKey);
@@ -358,6 +365,7 @@ function renderOverview(el) {
     $("tbody", el).innerHTML = rows.map(p => `
       <tr data-login="${esc(p.login)}" class="${p.login === state.current ? "selected" : ""}" style="cursor:pointer">
         <td>${esc(p.name || p.login)} <span class="muted">${p.name ? esc(p.login) : ""}</span>${p.role === "peer" ? '<span class="chip">peer</span>' : ""}</td>
+        <td class="l">${p.comparison.days} days${joinedLate(p) ? ` <span class="chip">joined ${date10(p.comparison.joined)}</span>` : ""}</td>
         ${groups.map(g => { const v = p.group_scores[g]; return `<td class="score" style="${scoreStyle(v)}">${v === undefined ? "–" : Math.round(v)}</td>`; }).join("")}
         ${OVERVIEW_COLS.map(k => `<td>${fmt(p.metrics[k], state.defs[k].unit)}</td>`).join("")}
       </tr>`).join("");
@@ -381,15 +389,22 @@ function rankText(r) {
   return parts.join(" · ") || "&nbsp;";
 }
 
-// someone whose first activity is well into the window is compared with people who had the whole year
-function tenureNote(u) {
-  const first = u.series.first_activity, from = state.manifest.from;
+// joiners are compared over their own window; a late first activity without a late join is only flagged
+function tenureNote(p, u) {
+  const first = u.series.first_activity;
+  if (joinedLate(p)) {
+    const c = p.comparison, base = baselineFor(p);
+    return `<div class="banner">Joined on <b>${date10(c.joined)}</b> (GitHub account created), so every comparison uses the same window:
+      <b>${windowText(p)}</b>. The organisation baseline is counted over those days, for the
+      ${base ? base.eligible_members : "?"} members who were already in the company (${base ? base.active_members : "?"} of them active)${
+      c.cohort.length > 1 ? `, and the ${c.cohort.length - 1} other people in this report are measured over the same days` : ""}.</div>`;
+  }
   if (!first) return `<div class="banner">No GitHub activity in this window.</div>`;
-  const late = (new Date(first) - new Date(from)) / 864e5;
-  return late > 60 ? `<div class="banner">First activity in the window is <b>${first}</b>, ${Math.round(late)} days after it starts
-    (new joiner, role change or a new account?). Totals are compared with people active for the whole period, so read the
-    org and cohort percentiles with that in mind, or re-run with <code>--days</code> covering only the active span.</div>`
-    : `<p class="sub">Active from ${first} to ${u.series.last_activity}.</p>`;
+  const late = (new Date(first) - new Date(state.manifest.from)) / 864e5;
+  return late > 60 ? `<div class="banner">First activity in the window is <b>${first}</b>, ${Math.round(late)} days after it starts, although
+    the account is older (transfer, leave or role change?). Totals are compared with people active for the whole period; re-run with
+    <code>--days</code> covering only the active span for a like-for-like comparison.</div>`
+    : `<p class="sub">Active from ${first} to ${u.series.last_activity}. Compared over ${windowText(p)}.</p>`;
 }
 
 function renderPerson(el, login) {
@@ -403,7 +418,7 @@ function renderPerson(el, login) {
       <div><div class="name">${esc(prof.name || prof.login)}${p.role === "peer" ? '<span class="chip">peer</span>' : ""}</div>
         <div class="login"><a href="${esc(prof.url)}" target="_blank" rel="noopener">${esc(prof.login)}</a>${prof.company ? " · " + esc(prof.company) : ""}</div></div>
     </div>
-    ${tenureNote(u)}
+    ${tenureNote(p, u)}
     <div class="tiles score-tiles" style="margin-bottom:12px">
       ${groups.map(([g, v]) => `<div class="tile" data-tip="${esc(g)} score: average percentile of the group's ranked metrics (100 = best end, 50 = typical)">
         <div class="label">${esc(g)}</div><div class="value">${Math.round(v)}<span class="muted" style="font-size:13px"> / 100</span></div>
@@ -418,9 +433,10 @@ function renderPerson(el, login) {
 
 function renderCompany(el, login) {
   const p = state.summary.people.find(x => x.login === login);
-  const b = state.baseline;
-  el.innerHTML = `<h2>Compared with the company</h2>
-    <p class="sub">${b ? `Every member of <b>${esc(state.summary.org.login)}</b> with any PR activity in the window (${b.active_members} of ${b.members}${b.sampled ? ", sampled" : ""}), counted with the same GitHub searches.` : ""}
+  const b = baselineFor(p);
+  el.innerHTML = `<h2>Compared with the company <span class="muted" style="font-weight:400">· ${windowText(p)}</span></h2>
+    <p class="sub">${b ? `Members of <b>${esc(state.summary.org.login)}</b> who were already in the company on ${date10(b.from)} and had any PR activity
+      over the same days (${b.active_members} of ${b.eligible_members} eligible${b.sampled ? ", sampled" : ""}), counted with the same GitHub searches.` : ""}
       Org counts come from search, so they can differ slightly from the detailed numbers below.</p><div id="strips"></div>`;
   orgStrip($("#strips", el), state.summary.metric_defs.filter(d => d.org), p);
 }
@@ -460,30 +476,105 @@ function renderWork(el, login) {
 
 function renderMetrics(el, login) {
   const p = state.summary.people.find(x => x.login === login), s = state.summary;
-  const multi = s.people.length > 1;
+  const multi = p.comparison.cohort.length > 1, base = baselineFor(p);
   const groups = [...new Set(s.metric_defs.map(d => d.group))];
   const better = { up: "↑ higher is better", down: "↓ lower is better" };
   el.innerHTML = `<h2>All metrics</h2>
-    <p class="sub">Hover a metric for its definition. "Score" is the percentile turned so that 100 is the good end; context-only metrics have no score.</p>
+    <p class="sub">Values cover the whole report window; medians and percentiles compare over ${windowText(p)}.
+      Hover a metric for its definition. "Score" is the percentile turned so that 100 is the good end; context-only metrics have no score.</p>
     <div class="scroll" style="max-height:none"><table>
       <thead><tr><th class="l">Metric</th><th>Value</th>
         ${multi ? "<th>Cohort median</th><th>Cohort pct</th>" : ""}
-        ${state.baseline ? "<th>Org median</th><th>Org pct</th>" : ""}<th>Score</th><th class="l">Direction</th></tr></thead>
+        ${base ? "<th>Org median</th><th>Org pct</th>" : ""}<th>Score</th><th class="l">Direction</th></tr></thead>
       <tbody>${groups.map(g => `<tr class="group-row"><td colspan="8">${esc(g)}</td></tr>` +
         s.metric_defs.filter(d => d.group === g).map(d => {
-          const r = p.ranks[d.key] || {}, b = state.baseline?.metrics?.[d.key];
+          const r = p.ranks[d.key] || {}, b = base?.metrics?.[d.key];
           const score = r.cohort_score ?? r.org_score;
           return `<tr><td class="l" data-tip="${esc(d.desc)}">${esc(d.label)}</td><td><b>${fmt(p.metrics[d.key], d.unit)}</b></td>
-            ${multi ? `<td>${fmt(s.cohort[d.key]?.median, d.unit)}</td><td>${fmtPct(r.cohort_pct)}</td>` : ""}
-            ${state.baseline ? `<td>${b ? fmt(b.median, d.unit) : "–"}</td><td>${fmtPct(r.org_pct)}</td>` : ""}
+            ${multi ? `<td>${fmt(p.comparison.cohort_median[d.key], d.unit)}</td><td>${fmtPct(r.cohort_pct)}</td>` : ""}
+            ${base ? `<td>${b ? fmt(b.median, d.unit) : "–"}</td><td>${fmtPct(r.org_pct)}</td>` : ""}
             <td class="score" style="${scoreStyle(score)}">${score === undefined || score === null ? "–" : Math.round(score)}</td>
             <td class="l muted">${better[d.better] || "context only"}</td></tr>`;
         }).join("")).join("")}</tbody></table></div>`;
 }
 
+// ------------------------------------------------------------------ what kind of work
+const heat = (v, max) => v ? `background: color-mix(in srgb, var(--series-1) ${Math.round(8 + 40 * v / Math.max(max, 1))}%, transparent)` : "";
+const catDesc = (kind, name) => (state.summary.categories?.[kind] || []).find(c => c.name === name)?.desc || "";
+
+function shareCell(n, total) {
+  const pct = total ? 100 * n / total : 0;
+  return `<td class="l" style="min-width:160px"><span style="display:inline-block;width:110px;height:8px;background:var(--surface-2);border-radius:4px;vertical-align:middle">
+    <span style="display:block;height:8px;width:${pct.toFixed(1)}%;background:var(--series-1);border-radius:0 4px 4px 0"></span></span>
+    <span style="font-variant-numeric:tabular-nums"> ${n} <span class="muted">(${Math.round(pct)}%)</span></span></td>`;
+}
+
+function mixTable(rows, kind, nameKey, total, extraHead = "", extraCell = () => "") {
+  if (!rows.length) return `<p class="empty">No pull requests in this window.</p>`;
+  return `<div class="scroll"><table><thead><tr><th class="l">${kind === "areas" ? "Area" : "Change type"}</th>
+    <th class="l">PRs (main ${kind === "areas" ? "area" : "type"})</th>${extraHead}<th>Merged</th><th>Lines +</th><th>Lines −</th>
+    <th>Median size</th><th>Median open → merged</th><th>Repos</th><th>With tests</th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td class="l" data-tip="${esc(catDesc(kind, r[nameKey]))}">${esc(r[nameKey])}</td>${shareCell(r.prs, total)}${extraCell(r)}
+      <td>${fmt(r.merged)}</td><td>${fmt(r.additions)}</td><td>${fmt(r.deletions)}</td><td>${fmt(r.size_median)}</td>
+      <td>${fmt(r.cycle_median_h, "hours")}</td><td>${fmt(r.repos)}</td><td>${r.prs ? Math.round(100 * r.with_tests / r.prs) + "%" : "–"}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+function heatTable(rows, cols, rowKey, rowLabel, colLabel) {
+  const max = Math.max(1, ...rows.flatMap(r => cols.map(c => r[c] || 0)));
+  return `<div class="scroll"><table><thead><tr><th class="l">${esc(rowLabel)}</th>${cols.map(c => `<th data-tip="${esc(c)}">${esc(colLabel(c))}</th>`).join("")}<th>Total</th></tr></thead><tbody>
+    ${rows.map(r => { const total = cols.reduce((a, c) => a + (r[c] || 0), 0);
+      return `<tr><td class="l">${esc(r[rowKey])}</td>${cols.map(c => `<td style="${heat(r[c] || 0, max)}" data-tip="${esc(`${r[rowKey]} · ${c}: ${r[c] || 0} PR(s)`)}">${r[c] || ""}</td>`).join("")}<td><b>${total}</b></td></tr>`; }).join("")}
+    </tbody></table></div>`;
+}
+
+function renderMix(el, login) {
+  const u = state.users[login], w = u.series.work_mix, p = state.summary.people.find(x => x.login === login);
+  if (!w) { el.innerHTML = `<h2>What kind of work</h2><p class="empty">This report was generated before PR classification existed.</p>`; return; }
+  const total = u.pull_requests.length;
+  const topAreas = w.areas.filter(a => a.prs).slice(0, 8).map(a => a.area);
+  const topTypes = w.types.slice(0, 8).map(t => t.type);
+  const monthLabel = m => { const [y, mo] = m.split("-"); return MONTHS[mo - 1]; };
+  const areaMonthRows = topAreas.map(a => ({ area: a, ...Object.fromEntries(w.area_monthly.map(m => [m.month, m[a] || 0])) }));
+  const months = w.area_monthly.map(m => m.month);
+  const crossRows = topTypes.map(t => ({ type: t, ...Object.fromEntries(w.type_by_area.filter(x => x.type === t).map(x => [x.area, x.prs])) }));
+  const reviewedTotal = w.review_areas.reduce((a, r) => a + r.prs, 0);
+  const lead = w.areas[0], leadType = w.types[0];
+  el.innerHTML = `<h2>What kind of work</h2>
+    <p class="sub">Every PR gets one <b>area</b> (the part of the system where most of its changed lines are; lock files and other generated files
+      count as only a few lines) and one <b>change type</b> (from a conventional-commit prefix, the title, the branch name, then the files).
+      Hover a name for its rule; the full list is at the bottom of the page.${w.partial_prs ? ` ${w.partial_prs} PR(s) changed over 100 files and were classified from their first 100.` : ""}</p>
+    ${lead ? `<div class="tiles" style="margin-bottom:14px">
+      <div class="tile"><div class="label">Main area</div><div class="value" style="font-size:20px">${esc(lead.area)}</div><div class="rank">${lead.prs} of ${total} PRs · ${Math.round(100 * lead.line_share)}% of changed lines</div></div>
+      <div class="tile"><div class="label">Most common change</div><div class="value" style="font-size:20px">${esc(leadType.type)}</div><div class="rank">${leadType.prs} of ${total} PRs</div></div>
+      <div class="tile"><div class="label">Areas worked in</div><div class="value">${fmt(p.metrics.areas_worked)}</div><div class="rank">main area of at least one PR</div></div>
+      <div class="tile" data-tip="${esc(state.defs.tests_included_share?.desc || "")}"><div class="label">Code PRs that include tests</div><div class="value">${fmt(p.metrics.tests_included_share, "pct")}</div><div class="rank">${rankText(p.ranks.tests_included_share || {})}</div></div>
+    </div>` : ""}
+    <h3 class="chart-title">By area</h3>
+    ${mixTable(w.areas.filter(a => a.prs || a.prs_touching), "areas", "area", total,
+      `<th data-tip="PRs with at least one changed file in this area, whatever their main area">Touched by</th><th data-tip="Share of all changed lines (generated files damped)">Line share</th>`,
+      r => `<td>${fmt(r.prs_touching)}</td><td>${Math.round(100 * r.line_share)}%</td>`)}
+    <h3 class="chart-title" style="margin-top:18px">By change type</h3>
+    ${mixTable(w.types, "types", "type", total)}
+    <div class="grid2" style="margin-top:18px">
+      <div><h3 class="chart-title">Main area by month (PRs opened)</h3>${heatTable(areaMonthRows, months, "area", "Area", monthLabel)}</div>
+      <div><h3 class="chart-title">Change type × area (PRs)</h3>${heatTable(crossRows, topAreas, "type", "Type \\ area", a => a.split(" ")[0])}</div>
+      <div><h3 class="chart-title">Most-changed directories (lines)</h3><div id="mix-dirs"></div></div>
+      <div><h3 class="chart-title">File types changed (files)</h3><div id="mix-ext"></div></div>
+      <div><h3 class="chart-title">Areas of the PRs they review (${reviewedTotal} PRs)</h3><div id="mix-rev-areas"></div></div>
+      <div><h3 class="chart-title">Kinds of PRs they review</h3><div id="mix-rev-types"></div></div>
+    </div>`;
+  hbars($("#mix-dirs", el), w.top_dirs, { label: r => r.dir, value: r => r.lines, tipFn: r => `${r.dir}\n${fmt(r.lines)} lines in ${r.prs} PR(s)` });
+  hbars($("#mix-ext", el), w.file_types, { label: r => r.ext, value: r => r.files });
+  hbars($("#mix-rev-areas", el), w.review_areas, { label: r => r.area, value: r => r.prs, tipFn: r => `${r.area}\n${r.prs} PRs reviewed · ${fmt(r.lines)} lines` });
+  hbars($("#mix-rev-types", el), w.review_types, { label: r => r.type, value: r => r.prs });
+}
+
 const PR_COLS = [
   { k: "repository", t: "Repo", l: true, v: p => (p.repository || "").split("/").pop() },
   { k: "title", t: "Title", l: true, v: p => p.title },
+  { k: "area", t: "Area", l: true, v: p => p.area || "" },
+  { k: "type", t: "Type", l: true, v: p => p.type || "" },
   { k: "state", t: "State", l: true, v: p => p.state },
   { k: "createdAt", t: "Opened", v: p => p.createdAt, f: date10 },
   { k: "size", t: "Lines", v: p => p.additions + p.deletions, f: v => fmt(v) },
@@ -497,7 +588,7 @@ const PR_COLS = [
 function renderPRs(el, login) {
   const u = state.users[login];
   el.innerHTML = `<h2>Pull requests opened <span class="muted" style="font-weight:400">(${u.pull_requests.length})</span></h2>
-    <p class="sub"><input type="search" id="pr-filter" placeholder="Filter by repo, title, state..."></p>
+    <p class="sub"><input type="search" id="pr-filter" placeholder="Filter by repo, title, state, area, type..."></p>
     <div class="scroll"><table><thead><tr>${PR_COLS.map(c => `<th class="${c.l ? "l" : ""}" data-k="${c.k}">${c.t}</th>`).join("")}</tr></thead><tbody></tbody></table></div>
     <h2 style="margin-top:22px">Reviews given <span class="muted" style="font-weight:400">(${u.reviews.length})</span></h2>
     <div class="scroll"><table><thead><tr><th class="l">Submitted</th><th class="l">Repo</th><th class="l">PR</th><th class="l">Author</th><th class="l">Outcome</th><th>Inline comments</th><th>PR lines</th><th>Hours after PR opened</th></tr></thead>
@@ -510,7 +601,7 @@ function renderPRs(el, login) {
   const draw = () => {
     const q = ($("#pr-filter", el).value || "").toLowerCase();
     const col = PR_COLS.find(c => c.k === state.prSort.key);
-    const rows = u.pull_requests.filter(p => !q || `${p.repository} ${p.title} ${p.state}`.toLowerCase().includes(q))
+    const rows = u.pull_requests.filter(p => !q || `${p.repository} ${p.title} ${p.state} ${p.area} ${p.type}`.toLowerCase().includes(q))
       .sort((a, b) => { const x = col.v(a), y = col.v(b);
         if (x === y) return 0; if (x === null) return 1; if (y === null) return -1;
         return (x < y ? -1 : 1) * (state.prSort.asc ? 1 : -1); });
@@ -527,6 +618,25 @@ function renderPRs(el, login) {
   draw();
 }
 
+function renderCost(el) {
+  const m = state.manifest, c = m.run_cost || {}, ai = c.ai || {};
+  const per = Object.entries(c.per_person || {});
+  el.innerHTML = `<h2>Run cost</h2>
+    <p class="sub">What it took to build this report. Data version <b>v${esc(m.data_version ?? "?")}</b>: raw data stored by an earlier
+      run with the same version is reused, and only the days it does not cover (plus the last ${"14"} days before that run, to pick up
+      late merges and reviews) are fetched again.</p>
+    <div class="tiles" style="margin-bottom:14px">
+      <div class="tile"><div class="label">GitHub API calls</div><div class="value">${fmt(c.github_api_calls ?? m.api_calls)}</div><div class="rank">GraphQL + REST search, all people + baselines</div></div>
+      <div class="tile" data-tip="${esc(ai.note || "")}"><div class="label">AI tokens</div><div class="value">${fmt((ai.input_tokens || 0) + (ai.output_tokens || 0))}</div>
+        <div class="rank">${ai.used ? `${fmt(ai.input_tokens)} in / ${fmt(ai.output_tokens)} out · ${esc(ai.model)}` : "no AI model is called"}</div></div>
+      <div class="tile"><div class="label">AI cost</div><div class="value">$${(ai.cost_usd || 0).toFixed(2)}</div><div class="rank">${esc(ai.note || "")}</div></div>
+    </div>
+    ${per.length ? `<div class="scroll"><table><thead><tr><th class="l">Person</th><th class="l">Stored data reused</th><th class="l">Ranges fetched this run</th><th>Open PRs refreshed</th><th>API calls</th></tr></thead><tbody>
+      ${per.map(([login, f]) => f ? `<tr><td class="l">${esc(login)}</td><td class="l">${f.reused_store ? "yes" : "no (first run or new version)"}</td>
+        <td class="l">${f.ranges.length ? f.ranges.map(r => `${r[0]} → ${r[1]}`).join(", ") : "none (all stored)"}</td>
+        <td>${fmt(f.open_prs_refreshed)}</td><td>${fmt(f.api_calls)}</td></tr>` : "").join("")}</tbody></table></div>` : ""}`;
+}
+
 function renderGlossary(el) {
   const s = state.summary, groups = [...new Set(s.metric_defs.map(d => d.group))];
   el.innerHTML = `<h2>How to read this</h2>
@@ -534,7 +644,10 @@ function renderGlossary(el) {
       on-call, design, mentoring, meetings and JIRA work do not show up here, and volume metrics (lines, commits) are easy to inflate.
       Compare people with similar roles and tenure.</p>
     ${groups.map(g => `<h3 class="chart-title" style="margin-top:12px">${esc(g)}</h3><table><tbody>${
-      s.metric_defs.filter(d => d.group === g).map(d => `<tr><td class="l" style="width:260px"><b>${esc(d.label)}</b></td><td class="wrap" style="max-width:none">${esc(d.desc)}</td></tr>`).join("")}</tbody></table>`).join("")}`;
+      s.metric_defs.filter(d => d.group === g).map(d => `<tr><td class="l" style="width:260px"><b>${esc(d.label)}</b></td><td class="wrap" style="max-width:none">${esc(d.desc)}</td></tr>`).join("")}</tbody></table>`).join("")}
+    ${s.categories ? [["areas", "PR areas (first matching rule per file wins, in this order)"], ["types", "PR change types (first match wins, in this order)"]].map(([k, title]) =>
+      `<h3 class="chart-title" style="margin-top:12px">${title}</h3><table><tbody>${s.categories[k].map(c =>
+        `<tr><td class="l" style="width:260px"><b>${esc(c.name)}</b></td><td class="wrap" style="max-width:none">${esc(c.desc)}</td></tr>`).join("")}</tbody></table>`).join("") : ""}`;
 }
 
 // ------------------------------------------------------------------ wiring
@@ -544,7 +657,7 @@ function selectPerson(login) {
   history.replaceState(null, "", "#" + encodeURIComponent(login));
   document.querySelectorAll("#overview-table tr[data-login]").forEach(tr => tr.classList.toggle("selected", tr.dataset.login === login));
   for (const [id, fn] of [["person-card", renderPerson], ["company-card", renderCompany], ["activity-card", renderActivity],
-                          ["work-card", renderWork], ["metrics-card", renderMetrics], ["prs-card", renderPRs]]) fn($("#" + id), login);
+                          ["work-card", renderWork], ["mix-card", renderMix], ["metrics-card", renderMetrics], ["prs-card", renderPRs]]) fn($("#" + id), login);
 }
 
 async function getJSON(path) {
@@ -557,7 +670,7 @@ async function load() {
   try {
     state.manifest = await getJSON("data/manifest.json");
     state.summary = await getJSON("data/" + state.manifest.summary);
-    if (state.manifest.org_baseline) state.baseline = await getJSON("data/" + state.manifest.org_baseline);
+    await Promise.all((state.manifest.org_baselines || []).map(async f => { state.baselines[f] = await getJSON("data/" + f); }));
     await Promise.all(state.manifest.people.map(async p => { state.users[p.login] = await getJSON("data/" + p.file); }));
   } catch (err) {
     $("#app").innerHTML = `<section class="card"><h2>Could not load the report data</h2>
@@ -568,7 +681,7 @@ async function load() {
   }
   state.summary.metric_defs.forEach(d => state.defs[d.key] = d);
   const m = state.manifest;
-  $("#meta").textContent = `${state.summary.org.name || m.org} · ${date10(m.from)} → ${date10(m.to)} (${m.days} days) · generated ${date10(m.generated_at)}`;
+  $("#meta").textContent = `${state.summary.org.name || m.org} · ${date10(m.from)} → ${date10(m.to)} (${m.days} days) · generated ${date10(m.generated_at)} · data v${m.data_version ?? "?"}`;
   const sel = $("#person-select");
   sel.innerHTML = m.people.map(p => `<option value="${esc(p.login)}">${esc(p.name || p.login)}${p.role === "peer" ? " (peer)" : ""}</option>`).join("");
   sel.addEventListener("change", () => selectPerson(sel.value));
@@ -579,11 +692,14 @@ async function load() {
     <section class="card" id="company-card"></section>
     <section class="card" id="activity-card"></section>
     <section class="card" id="work-card"></section>
+    <section class="card" id="mix-card"></section>
     <section class="card" id="metrics-card"></section>
     <section class="card" id="prs-card"></section>
-    <section class="card" id="glossary-card"></section>`;
+    <section class="card" id="glossary-card"></section>
+    <section class="card" id="cost-card"></section>`;
   renderOverview($("#overview-card"));
   renderGlossary($("#glossary-card"));
+  renderCost($("#cost-card"));
   const fromHash = decodeURIComponent(location.hash.slice(1));
   const first = m.people.find(p => p.login === fromHash) || m.people.find(p => p.role === "target") || m.people[0];
   selectPerson(first.login);

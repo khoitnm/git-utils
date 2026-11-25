@@ -70,11 +70,24 @@ except ImportError:  # pragma: no cover
     sys.exit("Missing dependency: pip install requests")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import pr_classify  # noqa: E402 - needs the sys.path line above
 TEMPLATE = SCRIPT_DIR / "report_template.html"
 DEFAULT_REPORTS_DIR = SCRIPT_DIR.parent / "reports" / "github-performance"
 CACHE_DIR = SCRIPT_DIR / ".cache"
 API = "https://api.github.com"
 
+# Version of the raw data this script fetches and stores. Bump it whenever the
+# queries or the stored layout change: stores and reports with another version
+# are then fetched again instead of reused. Metrics and PR classification are
+# recomputed from the raw data on every run, so changing those needs no bump.
+DATA_VERSION = 2
+BASELINE_VERSION = 1        # layout of the cached org baselines
+PEOPLE_CACHE_DIR = CACHE_DIR / "people"
+# Data fetched earlier can be stale near its fetch time (PRs merge later, reviews
+# arrive): re-fetch this many days before the last fetch on top of the new days.
+REFRESH_DAYS = 14
 DEFAULT_DAYS = 365
 MAX_DAYS = 730
 SEARCH_CAP = 1000           # GitHub search never returns more than this per query
@@ -82,6 +95,10 @@ PR_PAGE = 25                # PRs per page; each carries up to 50 reviews
 BASELINE_BATCH = 4          # people per aliased baseline query (x5 searches each)
 BASELINE_WORKERS = 4
 BASELINE_CACHE_DAYS = 7
+# Someone whose account was created more than this far into the window is a new
+# joiner: they are compared over [join date, end] only, with members who were
+# already in the org by then (enterprise accounts are created on joining).
+JOIN_GRACE_DAYS = 14
 SMALL_PR_LINES = 200        # "small PR" threshold, lines added + deleted
 DESCRIBED_PR_CHARS = 30     # a PR body shorter than this counts as "no description"
 
@@ -301,9 +318,10 @@ ORG_QUERY = "query($org:String!){ organization(login:$org){ id login name } }"
 PROFILE_QUERY = "query($login:String!){ user(login:$login){ login name company avatarUrl url createdAt } }"
 
 PR_FIELDS = """
-  number title url state isDraft createdAt mergedAt closedAt
-  additions deletions changedFiles baseRefName body
+  id number title url state isDraft createdAt mergedAt closedAt
+  additions deletions changedFiles baseRefName headRefName body
   repository { nameWithOwner }
+  files(first:100) { nodes { path additions deletions } }
   author { login }
   mergedBy { login }
   reviewDecision
@@ -313,11 +331,14 @@ PR_FIELDS = """
 """
 
 REVIEWED_FIELDS = """
-  number url title createdAt additions deletions
+  number url title createdAt additions deletions changedFiles headRefName
   author { login }
   repository { nameWithOwner }
+  files(first:60) { nodes { path additions deletions } }
   reviews(first:100, author:$login) { nodes { state submittedAt body comments { totalCount } } }
 """
+
+OPEN_PRS_QUERY = "query($ids:[ID!]!){ nodes(ids:$ids){ ... on PullRequest { %s } } }" % PR_FIELDS
 
 SEARCH_PAGE_QUERY = """
 query($q:String!, $after:String%s) {
@@ -331,7 +352,7 @@ query($q:String!, $after:String%s) {
 MEMBERS_QUERY = """
 query($org:String!, $after:String) {
   organization(login:$org) {
-    membersWithRole(first:100, after:$after) { pageInfo { hasNextPage endCursor } nodes { login } }
+    membersWithRole(first:100, after:$after) { pageInfo { hasNextPage endCursor } nodes { login createdAt } }
   }
 }"""
 
@@ -515,6 +536,14 @@ METRIC_DEFS: list[dict[str, Any]] = [
      "desc": "Sum of commits on the person's PRs, before any squash."},
     {"key": "repos_contributed", "group": "Delivery", "label": "Repositories contributed to", "unit": "count",
      "better": "up", "desc": "Distinct repos with a commit or an opened PR."},
+    {"key": "areas_worked", "group": "Delivery", "label": "Areas worked in", "unit": "count", "better": None,
+     "desc": "Distinct areas (frontend, backend, infrastructure...) that are the main area of at least one PR."},
+    {"key": "feature_pr_share", "group": "Delivery", "label": "Feature PRs", "unit": "pct", "better": None,
+     "desc": "Share of PRs classified as a feature (new behaviour). See 'What kind of work'."},
+    {"key": "bugfix_pr_share", "group": "Delivery", "label": "Bug-fix PRs", "unit": "pct", "better": None,
+     "desc": "Share of PRs classified as a bug fix."},
+    {"key": "dependency_pr_share", "group": "Delivery", "label": "Dependency / upgrade PRs", "unit": "pct",
+     "better": None, "desc": "Share of PRs that upgrade libraries, frameworks or runtimes."},
     {"key": "lines_added", "group": "Delivery", "label": "Lines added (merged PRs)", "unit": "count",
      "better": None, "desc": "Volume only - more lines is not better work."},
     {"key": "lines_deleted", "group": "Delivery", "label": "Lines deleted (merged PRs)", "unit": "count",
@@ -540,6 +569,9 @@ METRIC_DEFS: list[dict[str, Any]] = [
      "desc": "Merged PRs the author merged themselves with no approving review from anyone else."},
     {"key": "described_pr_share", "group": "Quality & process", "label": "PRs with a description",
      "unit": "pct", "better": "up", "desc": f"Share of PRs whose body has at least {DESCRIBED_PR_CHARS} characters."},
+    {"key": "tests_included_share", "group": "Quality & process", "label": "PRs that include tests",
+     "unit": "pct", "better": "up",
+     "desc": "Share of code PRs (feature, bug fix, refactor, performance) that also change test files."},
     {"key": "commits_per_pr_median", "group": "Quality & process", "label": "Commits per PR (median)",
      "unit": "num", "better": None, "desc": "Iteration per PR. Very high values can mean rework."},
     # Code review
@@ -594,33 +626,147 @@ METRIC_DEFS: list[dict[str, Any]] = [
 # --------------------------------------------------------------------------- #
 # per-person collection
 # --------------------------------------------------------------------------- #
-def fetch_person(gh: GitHub, login: str, org: str, start: datetime, end: datetime, quiet: bool) -> dict | None:
+def store_path(org: str, login: str) -> Path:
+    return PEOPLE_CACHE_DIR / org.lower() / f"{safe_name(login.lower())}.json"
+
+
+def load_store(org: str, login: str, quiet: bool) -> dict | None:
+    path = store_path(org, login)
+    if not path.is_file():
+        return None
+    try:
+        store = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        warn(f"{login}: unreadable data store {path.name} ({exc}); fetching everything again")
+        return None
+    if store.get("data_version") != DATA_VERSION:
+        log(f"  {login}: stored data is version {store.get('data_version')}, this script needs "
+            f"{DATA_VERSION}: fetching everything again", quiet=quiet)
+        return None
+    return store
+
+
+def day_ranges(days: set[date]) -> list[tuple[date, date]]:
+    """Sorted days -> contiguous (first, last) ranges."""
+    out: list[list[date]] = []
+    for d in sorted(days):
+        if out and d == out[-1][1] + timedelta(days=1):
+            out[-1][1] = d
+        else:
+            out.append([d, d])
+    return [(x, y) for x, y in out]
+
+
+def days_in(first: date, last: date) -> set[date]:
+    return {first + timedelta(days=i) for i in range((last - first).days + 1)}
+
+
+def plan_fetch(store: dict | None, start: datetime, end: datetime) -> list[tuple[date, date]]:
+    """The date ranges still to fetch: the requested days no store covers, plus
+    the last REFRESH_DAYS before the previous fetch when time has passed since."""
+    wanted = days_in(start.date(), end.date())
+    if not store:
+        return day_ranges(wanted)
+    covered: set[date] = set()
+    for first, last in store["covered"]:
+        covered |= days_in(date.fromisoformat(first), date.fromisoformat(last))
+    needed = wanted - covered
+    fetched_at = ts(store["fetched_at"])
+    if end - fetched_at > timedelta(hours=1):
+        needed |= wanted & days_in(fetched_at.date() - timedelta(days=REFRESH_DAYS), end.date())
+    return day_ranges(needed)
+
+
+def merge_by(old: list[dict], new: list[dict], key) -> list[dict]:
+    merged = {key(x): x for x in old}
+    merged.update({key(x): x for x in new})  # the newer copy wins
+    return list(merged.values())
+
+
+def fetch_person(gh: GitHub, login: str, org: str, start: datetime, end: datetime, quiet: bool,
+                 refresh: bool = False) -> dict | None:
     user = gh.query(PROFILE_QUERY, {"login": login}).get("user")
     if not user:
         error(f"{login}: no such GitHub user (or not visible to this token)")
         return None
     login = user["login"]  # canonical casing
-    a, b = start.date(), end.date()
+    calls_before = gh.calls
+    store = None if refresh else load_store(org, login, quiet)
+    ranges = plan_fetch(store, start, end)
+    had_store = store is not None
+    if store:
+        covered = ", ".join(f"{x}..{y}" for x, y in store["covered"])
+        todo = ", ".join(f"{x}..{y}" for x, y in ranges) or "nothing"
+        log(f"  {login}: stored data v{DATA_VERSION} covers {covered}; fetching {todo}", quiet=quiet)
+    store = store or {"data_version": DATA_VERSION, "org": org, "login": login, "covered": [],
+                      "pull_requests": [], "reviewed_prs": [], "commits": []}
 
-    counts = count_batch(gh, [login], org, a, b)[login]
-    authored = search_prs(gh, f"org:{org} is:pr author:{login}", "created", a, b, PR_FIELDS)
-    log(f"  {login}: {len(authored)} PR(s) opened", quiet=quiet)
-    reviewed = search_prs(gh, f"org:{org} is:pr reviewed-by:{login} -author:{login}", "updated", a, b,
-                          REVIEWED_FIELDS, {"login": login}, page_size=50)
-    reviews = [r for n in reviewed for r in flatten_reviews(n, start, end)]
-    log(f"  {login}: {len(reviews)} review(s) on {len(reviewed)} PR(s) by others", quiet=quiet)
-    try:
-        commits = search_commits(gh, login, org, a, b)
-    except GitHubError as exc:
-        error(f"{login}: commit search failed, commit metrics are empty: {exc}")
-        commits = []
-    log(f"  {login}: {len(commits)} commit(s) on default branches", quiet=quiet)
+    for a, b in ranges:
+        authored = search_prs(gh, f"org:{org} is:pr author:{login}", "created", a, b, PR_FIELDS)
+        reviewed = search_prs(gh, f"org:{org} is:pr reviewed-by:{login} -author:{login}", "updated", a, b,
+                              REVIEWED_FIELDS, {"login": login}, page_size=50)
+        try:
+            commits = search_commits(gh, login, org, a, b)
+        except GitHubError as exc:
+            error(f"{login}: commit search {a}..{b} failed, so commit metrics are incomplete: {exc}")
+            commits = []
+        store["pull_requests"] = merge_by(store["pull_requests"], [flatten_pr(n) for n in authored],
+                                          lambda p: p["url"])
+        store["reviewed_prs"] = merge_by(store["reviewed_prs"], [flatten_reviewed(n) for n in reviewed],
+                                         lambda p: p["url"])
+        store["commits"] = merge_by(store["commits"], commits, lambda c: c["sha"])
+        debug(f"{login} {a}..{b}: {len(authored)} PRs, {len(reviewed)} reviewed PRs, {len(commits)} commits")
 
+    # Open PRs from earlier fetches may have merged or closed since: refresh them by id.
+    first_fetched = min((a for a, _ in ranges), default=end.date() + timedelta(days=1))
+    stale = [p["id"] for p in store["pull_requests"]
+             if p["state"] == "OPEN" and p.get("id") and date.fromisoformat(p["createdAt"][:10]) < first_fetched]
+    for i in range(0, len(stale), 50):
+        nodes = gh.query(OPEN_PRS_QUERY, {"ids": stale[i:i + 50]}).get("nodes") or []
+        store["pull_requests"] = merge_by(store["pull_requests"], [flatten_pr(n) for n in nodes if n],
+                                          lambda p: p["url"])
+
+    covered = set()
+    for first, last in store["covered"]:
+        covered |= days_in(date.fromisoformat(first), date.fromisoformat(last))
+    for a, b in ranges:
+        covered |= days_in(a, b)
+    store["covered"] = [[x.isoformat(), y.isoformat()] for x, y in day_ranges(covered)]
+    if ranges or stale:
+        store["fetched_at"] = iso(end)
+    store.setdefault("fetched_at", iso(end))
+    path = store_path(org, login)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(store), encoding="utf-8")
+
+    counts = count_batch(gh, [login], org, start.date(), end.date())[login]
+    person = person_from_store(store, user, counts, start, end)
+    person["fetch"] = {"ranges": [[x.isoformat(), y.isoformat()] for x, y in ranges],
+                       "open_prs_refreshed": len(stale), "api_calls": gh.calls - calls_before,
+                       "reused_store": had_store}
+    log(f"  {login}: {len(person['pull_requests'])} PR(s) opened, {len(person['reviews'])} review(s) on "
+        f"{len({r['pr_url'] for r in person['reviews']})} PR(s) by others, {len(person['commits'])} commit(s) "
+        f"({person['fetch']['api_calls']} API calls)", quiet=quiet)
+    return person
+
+
+def person_from_store(store: dict, profile: dict, counts: dict, start: datetime, end: datetime) -> dict:
+    """The window's slice of the stored raw data, with every PR classified afresh
+    (so pr_classify.py changes apply without fetching again)."""
+    lo, hi = iso(start), iso(end)
+    prs = [dict(p) for p in store["pull_requests"] if lo <= p["createdAt"] <= hi]
+    for p in prs:
+        p.update(pr_classify.classify_pr(p["repository"], p.get("title") or "", p.get("headRefName"),
+                                         p.get("files") or [], p.get("changedFiles")))
+    prs.sort(key=lambda p: p["createdAt"], reverse=True)
+    commits = sorted((c for c in store["commits"] if c.get("date") and start <= ts(c["date"]) <= end),
+                     key=lambda c: c["date"], reverse=True)
     return {
-        "profile": user,
+        "data_version": DATA_VERSION,
+        "profile": profile,
         "counts": counts,
-        "pull_requests": [flatten_pr(n) for n in authored],
-        "reviews": reviews,
+        "pull_requests": prs,
+        "reviews": review_rows(store["reviewed_prs"], start, end),
         "commits": commits,
     }
 
@@ -633,6 +779,8 @@ def flatten_pr(node: dict) -> dict:
     pr["commits"] = (pr.get("commits") or {}).get("totalCount", 0)
     pr["comments"] = (pr.get("comments") or {}).get("totalCount", 0)
     pr["body_chars"] = len((pr.pop("body", "") or "").strip())  # length only: bodies are not stored
+    pr["files"] = [{"path": f["path"], "additions": f.get("additions", 0), "deletions": f.get("deletions", 0)}
+                   for f in (pr.pop("files", None) or {}).get("nodes") or [] if f]
     revs = pr.pop("reviews", {}) or {}
     pr["reviews_total"] = revs.get("totalCount", 0)
     pr["reviews"] = [{
@@ -645,26 +793,52 @@ def flatten_pr(node: dict) -> dict:
     return pr
 
 
-def flatten_reviews(pr: dict, start: datetime, end: datetime) -> list[dict]:
-    """One row per review the person submitted on this PR inside the window."""
+def flatten_reviewed(pr: dict) -> dict:
+    """A PR by someone else with every review the person left on it (any date:
+    the window is applied when the report is built)."""
+    return {
+        "url": pr.get("url"), "number": pr.get("number"), "title": pr.get("title"),
+        "createdAt": pr.get("createdAt"), "additions": pr.get("additions") or 0,
+        "deletions": pr.get("deletions") or 0, "changedFiles": pr.get("changedFiles"),
+        "headRefName": pr.get("headRefName"),
+        "author": (pr.get("author") or {}).get("login"),
+        "repository": (pr.get("repository") or {}).get("nameWithOwner"),
+        "files": [{"path": f["path"], "additions": f.get("additions", 0), "deletions": f.get("deletions", 0)}
+                  for f in (pr.get("files") or {}).get("nodes") or [] if f],
+        "reviews": [{"state": r.get("state"), "submittedAt": r.get("submittedAt"),
+                     "body_chars": len((r.get("body") or "").strip()),
+                     "comments": (r.get("comments") or {}).get("totalCount", 0)}
+                    for r in (pr.get("reviews") or {}).get("nodes") or [] if r],
+    }
+
+
+def review_rows(reviewed_prs: list[dict], start: datetime, end: datetime) -> list[dict]:
+    """One row per review the person submitted inside the window."""
     rows = []
-    for review in (pr.get("reviews") or {}).get("nodes") or []:
-        submitted = ts(review.get("submittedAt"))
-        if not submitted or not (start <= submitted <= end):
-            continue
-        rows.append({
-            "state": review.get("state"),
-            "submittedAt": review.get("submittedAt"),
-            "body_chars": len((review.get("body") or "").strip()),
-            "comments": (review.get("comments") or {}).get("totalCount", 0),
-            "pr_number": pr.get("number"),
-            "pr_url": pr.get("url"),
-            "pr_title": pr.get("title"),
-            "pr_createdAt": pr.get("createdAt"),
-            "pr_author": (pr.get("author") or {}).get("login"),
-            "pr_size": (pr.get("additions") or 0) + (pr.get("deletions") or 0),
-            "repository": (pr.get("repository") or {}).get("nameWithOwner"),
-        })
+    for pr in reviewed_prs:
+        kind = None
+        for review in pr["reviews"]:
+            submitted = ts(review.get("submittedAt"))
+            if not submitted or not (start <= submitted <= end):
+                continue
+            kind = kind or pr_classify.classify_pr(pr["repository"], pr.get("title") or "", pr.get("headRefName"),
+                                                   pr.get("files") or [], pr.get("changedFiles"))
+            rows.append({
+                "state": review.get("state"),
+                "submittedAt": review.get("submittedAt"),
+                "body_chars": review.get("body_chars", 0),
+                "comments": review.get("comments", 0),
+                "pr_number": pr.get("number"),
+                "pr_url": pr.get("url"),
+                "pr_title": pr.get("title"),
+                "pr_createdAt": pr.get("createdAt"),
+                "pr_author": pr.get("author"),
+                "pr_size": pr["additions"] + pr["deletions"],
+                "repository": pr.get("repository"),
+                "pr_area": kind["area"],
+                "pr_type": kind["type"],
+            })
+    rows.sort(key=lambda r: r["submittedAt"], reverse=True)
     return rows
 
 
@@ -705,6 +879,9 @@ def calendar_metrics(calendar: list[dict]) -> dict[str, Any]:
     }
 
 
+CODE_TYPES = {"Feature", "Bug fix", "Refactor & cleanup", "Performance"}
+
+
 def person_metrics(person: dict) -> dict[str, Any]:
     login = person["profile"]["login"]
     prs = person["pull_requests"]
@@ -734,8 +911,15 @@ def person_metrics(person: dict) -> dict[str, Any]:
         first_by_pr.setdefault(r["pr_url"], r)
     repos = {p["repository"] for p in prs} | {c["repository"] for c in person["commits"]}
 
+    code_prs = [p for p in prs if p.get("type") in CODE_TYPES]
+    kinds = Counter(p.get("type") for p in prs)
     m = calendar_metrics(person["calendar"])
     m.update({
+        "areas_worked": len({p.get("area") for p in prs if p.get("area") not in (None, "Other")}),
+        "feature_pr_share": ratio(kinds.get("Feature", 0), len(prs)),
+        "bugfix_pr_share": ratio(kinds.get("Bug fix", 0), len(prs)),
+        "dependency_pr_share": ratio(kinds.get("Dependency & platform upgrade", 0), len(prs)),
+        "tests_included_share": ratio(sum(1 for p in code_prs if p.get("touches_tests")), len(code_prs)),
         "prs_opened": len(prs),
         "prs_merged": len(merged),
         "prs_open_now": sum(1 for p in prs if p["state"] == "OPEN"),
@@ -821,6 +1005,7 @@ def person_series(person: dict, start: datetime, end: datetime) -> dict[str, Any
     states = Counter(r["state"] for r in person["reviews"])
     active_dates = [d["date"] for d in person["calendar"] if d["count"]]
     return {
+        "work_mix": work_mix(person, months),
         "first_activity": active_dates[0] if active_dates else None,
         "last_activity": active_dates[-1] if active_dates else None,
         "monthly": list(monthly.values()),
@@ -832,11 +1017,93 @@ def person_series(person: dict, start: datetime, end: datetime) -> dict[str, Any
     }
 
 
+def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
+    """Detailed statistics on what kind of PRs the person opens and reviews."""
+    prs = person["pull_requests"]
+    total_weight: Counter = Counter()
+    for p in prs:
+        total_weight.update(p.get("areas") or {})
+
+    def stats(group: list[dict]) -> dict[str, Any]:
+        merged = [p for p in group if p["state"] == "MERGED"]
+        return {
+            "prs": len(group), "merged": len(merged),
+            "additions": sum(p["additions"] for p in group), "deletions": sum(p["deletions"] for p in group),
+            "files": sum(p.get("changedFiles") or 0 for p in group),
+            "size_median": median(p["additions"] + p["deletions"] for p in group),
+            "cycle_median_h": median(hours(p["createdAt"], p["mergedAt"]) for p in merged),
+            "repos": len({p["repository"] for p in group}),
+            "with_tests": sum(1 for p in group if p.get("touches_tests")),
+        }
+
+    by_area: dict[str, list[dict]] = defaultdict(list)
+    by_type: dict[str, list[dict]] = defaultdict(list)
+    for p in prs:
+        by_area[p.get("area", "Other")].append(p)
+        by_type[p.get("type", "Other change")].append(p)
+    touching = Counter(a for p in prs for a in (p.get("areas") or {}))
+    weight_sum = sum(total_weight.values()) or 1
+    areas = [{"area": a, **stats(by_area[a]), "prs_touching": touching.get(a, 0),
+              "line_share": round(total_weight.get(a, 0) / weight_sum, 3)}
+             for a in pr_classify.AREAS if by_area.get(a) or touching.get(a)]
+    areas.sort(key=lambda r: (-r["prs"], -r["prs_touching"]))
+    types = [{"type": t, **stats(by_type[t])} for t in pr_classify.TYPES if by_type.get(t)]
+    types.sort(key=lambda r: -r["prs"])
+
+    area_monthly = {m: Counter() for m in months}
+    type_monthly = {m: Counter() for m in months}
+    for p in prs:
+        month = p["createdAt"][:7]
+        if month in area_monthly:
+            area_monthly[month][p.get("area", "Other")] += 1
+            type_monthly[month][p.get("type", "Other change")] += 1
+    cross = Counter((p.get("type", "Other change"), p.get("area", "Other")) for p in prs)
+
+    dirs: Counter = Counter()
+    dir_prs: dict[str, set] = defaultdict(set)
+    for p in prs:
+        for f in p.get("files") or []:
+            parts = f["path"].split("/")
+            key = f"{(p['repository'] or '').split('/')[-1]}/" + "/".join(parts[:2] if len(parts) > 2 else parts[:1])
+            dirs[key] += pr_classify.file_weight(f["path"], f["additions"], f["deletions"])
+            dir_prs[key].add(p["url"])
+    exts = Counter()
+    for p in prs:
+        for f in p.get("files") or []:
+            name = f["path"].rsplit("/", 1)[-1]
+            exts[("." + name.rsplit(".", 1)[-1].lower()) if "." in name else name] += 1
+
+    reviewed: dict[str, dict] = {}
+    for r in person["reviews"]:
+        reviewed.setdefault(r["pr_url"], r)
+    review_areas = Counter(r.get("pr_area", "Other") for r in reviewed.values())
+    review_types = Counter(r.get("pr_type", "Other change") for r in reviewed.values())
+    review_lines = Counter()
+    for r in reviewed.values():
+        review_lines[r.get("pr_area", "Other")] += r["pr_size"]
+
+    return {
+        "areas": areas,
+        "types": types,
+        "area_monthly": [{"month": m, **dict(c)} for m, c in area_monthly.items()],
+        "type_monthly": [{"month": m, **dict(c)} for m, c in type_monthly.items()],
+        "type_by_area": [{"type": t, "area": a, "prs": n} for (t, a), n in cross.most_common()],
+        "top_dirs": [{"dir": d, "lines": w, "prs": len(dir_prs[d])} for d, w in dirs.most_common(15)],
+        "file_types": [{"ext": e, "files": n} for e, n in exts.most_common(15)],
+        "review_areas": [{"area": a, "prs": n, "lines": review_lines[a]} for a, n in review_areas.most_common()],
+        "review_types": [{"type": t, "prs": n} for t, n in review_types.most_common()],
+        "partial_prs": sum(1 for p in prs if p.get("files_partial")),
+        "type_sources": dict(Counter(p.get("type_source", "none") for p in prs)),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # organisation baseline
 # --------------------------------------------------------------------------- #
-def org_members(gh: GitHub, org: str) -> list[str]:
-    return [n["login"] for n in paginate(gh, MEMBERS_QUERY, {"org": org}, ["organization", "membersWithRole"])]
+def org_members(gh: GitHub, org: str) -> dict[str, str]:
+    """login -> account creation time, which is the join date for enterprise accounts."""
+    nodes = paginate(gh, MEMBERS_QUERY, {"org": org}, ["organization", "membersWithRole"])
+    return {n["login"]: n.get("createdAt") for n in nodes}
 
 
 def team_members(gh: GitHub, org: str, team: str) -> list[str]:
@@ -848,28 +1115,35 @@ def team_members(gh: GitHub, org: str, team: str) -> list[str]:
                                          ["organization", "team", "members"])]
 
 
-def build_baseline(gh: GitHub, org: str, start: datetime, end: datetime, sample: int | None,
+def build_baseline(gh: GitHub, org: str, since: datetime, end: datetime, label: str, sample: int | None,
                    refresh: bool, quiet: bool) -> dict[str, Any]:
+    """COUNT_SEARCHES over [since, end] for every org member, plus their join dates.
+    Cached per window (label) for BASELINE_CACHE_DAYS."""
     CACHE_DIR.mkdir(exist_ok=True)
-    cache = CACHE_DIR / f"org_baseline_{org}_{(end - start).days}d_{sample or 'all'}.json"
+    cache = CACHE_DIR / f"org_baseline_{org}_{label}_{sample or 'all'}.json"
     if cache.is_file() and not refresh:
         cached = json.loads(cache.read_text(encoding="utf-8"))
         age = datetime.now(timezone.utc) - ts(cached["generated_at"])
-        if age < timedelta(days=BASELINE_CACHE_DAYS):
-            log(f"org baseline: using the cache from {cached['generated_at'][:10]} "
+        if age < timedelta(days=BASELINE_CACHE_DAYS) and cached.get("baseline_version", 1) == BASELINE_VERSION:
+            if "joined" not in cached:  # cache from before join dates were kept: add them (cheap)
+                log("org baseline: adding member join dates to the cached baseline...", quiet=quiet)
+                cached["joined"] = org_members(gh, org)
+                cache.write_text(json.dumps(cached), encoding="utf-8")
+            log(f"org baseline ({label}): using the cache from {cached['generated_at'][:10]} "
                 f"({len(cached['members'])} members; --refresh-baseline rebuilds it)", quiet=quiet)
             return cached
 
-    log(f"org baseline: listing members of {org}...", quiet=quiet)
-    members = org_members(gh, org)
+    log(f"org baseline ({label}): listing members of {org}...", quiet=quiet)
+    joined = org_members(gh, org)
+    members = list(joined)
     if sample and sample < len(members):
         members = random.Random(42).sample(members, sample)
     batches = [members[i:i + BASELINE_BATCH] for i in range(0, len(members), BASELINE_BATCH)]
-    log(f"org baseline: counting activity of {len(members)} member(s) in {len(batches)} request(s)...",
-        quiet=quiet)
+    log(f"org baseline ({label}): counting activity of {len(members)} member(s) from {since.date()} "
+        f"in {len(batches)} request(s)...", quiet=quiet)
     results: dict[str, dict] = {}
     failed = 0
-    a, b = start.date(), end.date()
+    a, b = since.date(), end.date()
     with ThreadPoolExecutor(BASELINE_WORKERS) as pool:
         futures = {pool.submit(count_batch, gh, batch, org, a, b): batch for batch in batches}
         for done, fut in enumerate(as_completed(futures), 1):
@@ -882,17 +1156,24 @@ def build_baseline(gh: GitHub, org: str, start: datetime, end: datetime, sample:
                 log(f"  baseline {done}/{len(batches)}", quiet=quiet)
     if failed:
         warn(f"org baseline: {failed} member(s) could not be counted and are left out")
-    baseline = {"generated_at": iso(datetime.now(timezone.utc)), "org": org, "from": iso(start), "to": iso(end),
-                "sampled": bool(sample), "members": results}
+    baseline = {"generated_at": iso(datetime.now(timezone.utc)), "org": org, "from": iso(since), "to": iso(end),
+                "sampled": bool(sample), "members": results, "baseline_version": BASELINE_VERSION,
+                "joined": {login: joined.get(login) for login in members}}
     cache.write_text(json.dumps(baseline), encoding="utf-8")
     return baseline
 
 
-def baseline_stats(baseline: dict) -> dict[str, Any]:
-    """Anonymous distributions of the org members with any PR activity."""
+def baseline_stats(baseline: dict, since: datetime) -> dict[str, Any]:
+    """Anonymous distributions over the members who were already in the org at
+    `since` (so they had the whole window too) and had any PR activity in it."""
     members = baseline.get("members") or {}
-    active = [v for v in members.values() if v["prs_opened"] + v["prs_reviewed"] + v["prs_commented"] > 0]
-    stats: dict[str, Any] = {"members": len(members), "active_members": len(active), "metrics": {}}
+    joined = baseline.get("joined") or {}
+    eligible = [v for login, v in members.items()
+                if not joined.get(login) or ts(joined[login]) <= since + timedelta(days=JOIN_GRACE_DAYS)]
+    active = [v for v in eligible if v["prs_opened"] + v["prs_reviewed"] + v["prs_commented"] > 0]
+    stats: dict[str, Any] = {"generated_at": baseline["generated_at"], "sampled": baseline["sampled"],
+                             "from": iso(since), "to": baseline["to"], "members": len(members),
+                             "eligible_members": len(eligible), "active_members": len(active), "metrics": {}}
     for mdef in METRIC_DEFS:
         if not mdef.get("org"):
             continue
@@ -909,24 +1190,80 @@ def baseline_stats(baseline: dict) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # comparison
 # --------------------------------------------------------------------------- #
-def compare(people: dict[str, dict], org_stats: dict | None) -> dict[str, Any]:
-    cohort: dict[str, Any] = {}
-    for mdef in METRIC_DEFS:
-        values = [p["metrics"].get(mdef["key"]) for p in people.values()]
-        clean = [v for v in values if v is not None]
-        cohort[mdef["key"]] = {"median": median(clean), "min": min(clean, default=None),
-                               "max": max(clean, default=None)}
+def comparison_start(person: dict, start: datetime) -> datetime:
+    """Where this person's comparison window starts: the window start, or the day
+    their account was created when that is well inside the window."""
+    created = ts(person["profile"].get("createdAt"))
+    if created and created > start + timedelta(days=JOIN_GRACE_DAYS):
+        return created.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start
 
-    for person in people.values():
+
+def slice_person(person: dict, since: datetime, end: datetime, counts: dict) -> dict:
+    """The person's raw data cut down to [since, end], to compare them with a
+    newer colleague over the same days."""
+    cut = iso(since)
+    sliced = {**person,
+              "pull_requests": [p for p in person["pull_requests"] if p["createdAt"] >= cut],
+              "reviews": [r for r in person["reviews"] if r["submittedAt"] >= cut],
+              "commits": [c for c in person["commits"] if c["date"] and ts(c["date"]) >= since],
+              "counts": counts}
+    sliced["calendar"] = build_calendar(sliced, since, end)
+    return sliced
+
+
+def build_windows(gh: GitHub, org: str, people: dict[str, dict], start: datetime, end: datetime,
+                  args: argparse.Namespace) -> dict[datetime, dict]:
+    """For every distinct comparison start: the cohort members who were around for
+    the whole window, with their metrics over it, and the org distribution."""
+    windows: dict[datetime, dict] = {}
+    for since in sorted({p["comparison_since"] for p in people.values()}):
+        eligible = [p for p in people.values() if p["comparison_since"] <= since]
+        logins = [p["profile"]["login"] for p in eligible]
+        if since == start:
+            counts = {p["profile"]["login"]: p["counts"] for p in eligible}
+        else:
+            log(f"comparison window from {since.date()}: {len(eligible)} cohort member(s)", quiet=args.quiet)
+            counts = {}
+            for i in range(0, len(logins), BASELINE_BATCH):
+                counts.update(count_batch(gh, logins[i:i + BASELINE_BATCH], org, since.date(), end.date()))
+        cohort = {}
+        for p in eligible:
+            login = p["profile"]["login"]
+            metrics = p["metrics"] if since == start else person_metrics(slice_person(p, since, end, counts[login]))
+            cohort[login] = {"metrics": metrics, "counts": counts[login]}
+
+        org_stats = None
+        if not args.no_baseline:
+            label = f"{(end - start).days}d" if since == start else f"since-{since.date()}"
+            try:
+                baseline = build_baseline(gh, org, since, end, label, args.baseline_sample,
+                                          args.refresh_baseline, args.quiet)
+                org_stats = baseline_stats(baseline, since)
+                org_stats["file"] = "org_baseline.json" if since == start else f"org_baseline_{since.date()}.json"
+            except GitHubError as exc:
+                error(f"org baseline from {since.date()} failed, so org percentiles are missing: {exc}")
+        windows[since] = {"cohort": cohort, "org": org_stats}
+    return windows
+
+
+def compare(people: dict[str, dict], windows: dict[datetime, dict], start: datetime, end: datetime) -> None:
+    for login, person in people.items():
+        since = person["comparison_since"]
+        cohort, org_stats = windows[since]["cohort"], windows[since]["org"]
+        own = cohort[login]
         ranks: dict[str, Any] = {}
         groups: dict[str, list[float]] = defaultdict(list)
+        cohort_median = {}
         for mdef in METRIC_DEFS:
-            key, value = mdef["key"], person["metrics"].get(mdef["key"])
+            key = mdef["key"]
+            population = [c["metrics"].get(key) for c in cohort.values()]
+            cohort_median[key] = median(population)
             entry: dict[str, Any] = {}
-            if len(people) > 1:
-                entry["cohort_pct"] = percentile_rank(value, [p["metrics"].get(key) for p in people.values()])
+            if len(cohort) > 1:
+                entry["cohort_pct"] = percentile_rank(own["metrics"].get(key), population)
             if org_stats and key in org_stats["metrics"]:
-                entry["org_value"] = person["counts"].get(key)
+                entry["org_value"] = own["counts"].get(key)
                 entry["org_pct"] = percentile_rank(entry["org_value"], org_stats["metrics"][key]["values"])
             # score = the percentile turned so that 100 is always the good end
             for scope in ("cohort", "org"):
@@ -939,7 +1276,15 @@ def compare(people: dict[str, dict], org_stats: dict | None) -> dict[str, Any]:
             ranks[key] = entry
         person["ranks"] = ranks
         person["group_scores"] = {g: round(statistics.mean(v), 1) for g, v in groups.items()}
-    return cohort
+        person["comparison"] = {
+            "from": iso(since), "to": iso(end), "days": (end - since).days,
+            "reason": "full window" if since == start else "joined during the window",
+            "joined": person["profile"].get("createdAt"),
+            "cohort": sorted(cohort), "cohort_median": cohort_median,
+            "org_file": org_stats["file"] if org_stats else None,
+            "org_eligible": org_stats["eligible_members"] if org_stats else None,
+            "org_active": org_stats["active_members"] if org_stats else None,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -993,6 +1338,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-baseline", action="store_true", help="skip the company-wide baseline")
     p.add_argument("--baseline-sample", type=int, help="count only N random org members for the baseline")
     p.add_argument("--refresh-baseline", action="store_true", help="ignore the cached baseline")
+    p.add_argument("--refresh-data", action="store_true",
+                   help="ignore the stored per-person data and fetch the whole window again")
     p.add_argument("--out", type=Path, default=DEFAULT_REPORTS_DIR, help="reports folder")
     p.add_argument("--no-serve", action="store_true", help="write the report and exit (no local server)")
     p.add_argument("--no-open", action="store_true", help="serve, but do not open a browser")
@@ -1080,7 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
         for role, logins in (("target", targets), ("peer", peers)):
             for login in logins:
                 try:
-                    person = fetch_person(gh, login, org, start, end, args.quiet)
+                    person = fetch_person(gh, login, org, start, end, args.quiet, args.refresh_data)
                 except GitHubError as exc:
                     error(f"{login}: {exc}")
                     continue
@@ -1095,45 +1442,54 @@ def main(argv: list[str] | None = None) -> int:
             log("ERROR: none of the requested people could be analysed")
             return 2
 
-        baseline = org_stats = None
-        if not args.no_baseline:
-            try:
-                baseline = build_baseline(gh, org, start, end, args.baseline_sample,
-                                          args.refresh_baseline, args.quiet)
-                org_stats = baseline_stats(baseline)
-            except GitHubError as exc:
-                error(f"org baseline failed, so org percentiles are missing: {exc}")
+        for person in people.values():
+            person["comparison_since"] = comparison_start(person, start)
+            if person["comparison_since"] != start:
+                log(f"{person['profile']['login']} joined on {person['comparison_since'].date()}: compared over "
+                    f"the same {(end - person['comparison_since']).days} days only", quiet=args.quiet)
+        windows = build_windows(gh, org, people, start, end, args)
     except GitHubError as exc:
         log(f"ERROR: {exc}")
         if DEBUG:
             traceback.print_exc()
         return 2
 
-    cohort = compare(people, org_stats)
+    compare(people, windows, start, end)
 
-    folder = args.out / end.strftime("%Y%m%d-%H%M%S")
+    folder = args.out / f"{end.strftime('%Y%m%d-%H%M%S')}_v{DATA_VERSION}"
     data_dir = folder / "data"
     people_index = []
     for login, person in people.items():
+        person.pop("comparison_since", None)
         name = f"users/{safe_name(login)}.json"
         write_json(data_dir / name, person)
         people_index.append({"login": login, "name": person["profile"].get("name"), "role": person["role"],
                              "file": name})
     write_json(data_dir / "summary.json", {
-        "org": org_data, "from": iso(start), "to": iso(end), "days": days,
-        "metric_defs": METRIC_DEFS, "cohort": cohort,
+        "data_version": DATA_VERSION,
+        "org": org_data, "from": iso(start), "to": iso(end), "days": days, "metric_defs": METRIC_DEFS,
+        "categories": pr_classify.category_defs(),
         "people": [{"login": l, "name": p["profile"].get("name"), "role": p["role"], "metrics": p["metrics"],
-                    "counts": p["counts"], "ranks": p["ranks"], "group_scores": p["group_scores"]}
-                   for l, p in people.items()],
+                    "counts": p["counts"], "ranks": p["ranks"], "group_scores": p["group_scores"],
+                    "comparison": p["comparison"]} for l, p in people.items()],
     })
-    if org_stats:
-        write_json(data_dir / "org_baseline.json", {"generated_at": baseline["generated_at"],
-                                                    "sampled": baseline["sampled"], **org_stats})
+    org_files = []
+    for window in windows.values():
+        if window["org"]:
+            write_json(data_dir / window["org"]["file"], {"data_version": DATA_VERSION, **window["org"]})
+            org_files.append(window["org"]["file"])
     write_json(data_dir / "manifest.json", {
         "generated_at": iso(datetime.now(timezone.utc)), "org": org, "from": iso(start), "to": iso(end),
-        "days": days, "people": people_index, "summary": "summary.json",
-        "org_baseline": "org_baseline.json" if org_stats else None,
-        "problems": PROBLEMS, "api_calls": gh.calls,
+        "days": days, "people": people_index, "summary": "summary.json", "org_baselines": org_files,
+        "problems": PROBLEMS, "api_calls": gh.calls, "data_version": DATA_VERSION,
+        "run_cost": {
+            "github_api_calls": gh.calls,
+            "per_person": {l: p.get("fetch") for l, p in people.items()},
+            # Nothing here calls an LLM: PR areas and types come from the regex rules
+            # in pr_classify.py. Kept explicit so the report can say so.
+            "ai": {"used": False, "model": None, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                   "note": "PR classification is rule-based (pr_classify.py); no AI model is called."},
+        },
     })
     shutil.copyfile(TEMPLATE, folder / "index.html")
     print(folder.resolve(), flush=True)
