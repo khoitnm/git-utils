@@ -144,8 +144,18 @@ serves the folder on `127.0.0.1` and opens the browser. Ctrl+C stops the server.
 
 ## Caveats
 
-These numbers measure GitHub activity, not the value of the work. Design, mentoring,
-on-call, meetings and JIRA work don't show up. Compare people with similar roles
-and tenure. The report flags people whose first activity is well into the window.
-Commit search only sees default branches and commits whose author email is linked to
-the account.
+Every report opens with this note:
+
+* **Don't rely on these numbers alone to evaluate a person.** They are a starting point for a
+  conversation, alongside what teammates, leads and the work itself say.
+* **They are not enough to judge someone's contribution.** Much of what matters can't be
+  measured correctly, even when there is a number for it: design, mentoring, unblocking
+  others, incidents and on-call, JIRA and requirements work, and the difficulty and impact of
+  a change. Volume metrics (PRs, commits, lines) are easy to inflate.
+* **What the numbers mean will change over time.** Review counts and comments mean
+  something different once AI generates review comments. Approval counts mean something
+  different in teams that let people approve and merge their own PRs, or need no approval.
+  Compare people only within the same period and similar team practices.
+
+Also: commit search only sees default branches and commits whose author email is linked to
+the account, and the report flags people whose first activity is well into the window.
