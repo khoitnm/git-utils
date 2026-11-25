@@ -548,7 +548,7 @@ METRIC_DEFS: list[dict[str, Any]] = [
     {"key": "repos_contributed", "group": "Delivery", "label": "Repositories contributed to", "unit": "count",
      "better": "up", "desc": "Distinct repos with a commit or an opened PR."},
     {"key": "areas_worked", "group": "Delivery", "label": "Areas worked in", "unit": "count", "better": None,
-     "desc": "Distinct areas (frontend, backend, infrastructure...) that are the main area of at least one PR."},
+     "desc": "Distinct top-level areas (Backend, Frontend, Infrastructure & delivery...) that are the main area of at least one PR."},
     {"key": "feature_pr_share", "group": "Delivery", "label": "Feature PRs", "unit": "pct", "better": None,
      "desc": "Share of PRs classified as a feature (new behaviour). See 'What kind of work'."},
     {"key": "bugfix_pr_share", "group": "Delivery", "label": "Bug-fix PRs", "unit": "pct", "better": None,
@@ -980,7 +980,7 @@ def person_metrics(person: dict) -> dict[str, Any]:
     kinds = Counter(p.get("type") for p in prs)
     m = calendar_metrics(person["calendar"])
     m.update({
-        "areas_worked": len({p.get("area") for p in prs if p.get("area") not in (None, "Other")}),
+        "areas_worked": len({p.get("area_parent") for p in prs if p.get("area_parent") not in (None, "Docs & other")}),
         "feature_pr_share": ratio(kinds.get("Feature", 0), len(prs)),
         "bugfix_pr_share": ratio(kinds.get("Bug fix", 0), len(prs)),
         "dependency_pr_share": ratio(kinds.get("Dependency & platform upgrade", 0), len(prs)),
@@ -1100,17 +1100,35 @@ def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
             "with_tests": sum(1 for p in group if p.get("touches_tests")),
         }
 
-    by_area: dict[str, list[dict]] = defaultdict(list)
+    by_child: dict[str, list[dict]] = defaultdict(list)
+    by_parent: dict[str, list[dict]] = defaultdict(list)
     by_type: dict[str, list[dict]] = defaultdict(list)
     for p in prs:
-        by_area[p.get("area", "Other")].append(p)
+        by_child[p.get("area", "")].append(p)
+        by_parent[p.get("area_parent", "Docs & other")].append(p)
         by_type[p.get("type", "Other change")].append(p)
-    touching = Counter(a for p in prs for a in (p.get("areas") or {}))
+    touching_child = Counter(a for p in prs for a in (p.get("areas") or {}))
+    touching_parent = Counter(a for p in prs for a in (p.get("area_parents") or {}))
+    parent_weight: Counter = Counter()
+    for area, weight in total_weight.items():
+        parent_weight[pr_classify.area_parent(area)] += weight
     weight_sum = sum(total_weight.values()) or 1
-    areas = [{"area": a, **stats(by_area[a]), "prs_touching": touching.get(a, 0),
-              "line_share": round(total_weight.get(a, 0) / weight_sum, 3)}
-             for a in pr_classify.AREAS if by_area.get(a) or touching.get(a)]
-    areas.sort(key=lambda r: (-r["prs"], -r["prs_touching"]))
+
+    # Parents with their children right below them, biggest first.
+    areas = []
+    for parent in sorted(pr_classify.PARENTS, key=lambda x: (-len(by_parent.get(x, [])), -touching_parent.get(x, 0))):
+        if not by_parent.get(parent) and not touching_parent.get(parent):
+            continue
+        areas.append({"area": parent, "label": parent, "level": 0, **stats(by_parent[parent]),
+                      "prs_touching": touching_parent.get(parent, 0),
+                      "line_share": round(parent_weight.get(parent, 0) / weight_sum, 3)})
+        children = [a for a in pr_classify.AREAS if pr_classify.area_parent(a) == parent
+                    and (by_child.get(a) or touching_child.get(a))
+                    and pr_classify.area_child(a) != parent]  # "Dependencies & build > Dependencies & build"
+        for child in sorted(children, key=lambda x: (-len(by_child.get(x, [])), -touching_child.get(x, 0))):
+            areas.append({"area": child, "label": pr_classify.area_child(child), "level": 1,
+                          "parent": parent, **stats(by_child[child]), "prs_touching": touching_child.get(child, 0),
+                          "line_share": round(total_weight.get(child, 0) / weight_sum, 3)})
     types = [{"type": t, **stats(by_type[t])} for t in pr_classify.TYPES if by_type.get(t)]
     types.sort(key=lambda r: -r["prs"])
 
@@ -1119,9 +1137,9 @@ def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
     for p in prs:
         month = p["createdAt"][:7]
         if month in area_monthly:
-            area_monthly[month][p.get("area", "Other")] += 1
+            area_monthly[month][p.get("area_parent", "Docs & other")] += 1
             type_monthly[month][p.get("type", "Other change")] += 1
-    cross = Counter((p.get("type", "Other change"), p.get("area", "Other")) for p in prs)
+    cross = Counter((p.get("type", "Other change"), p.get("area_parent", "Docs & other")) for p in prs)
 
     dirs: Counter = Counter()
     dir_prs: dict[str, set] = defaultdict(set)
@@ -1143,11 +1161,15 @@ def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
     reviewed: dict[str, dict] = {}
     for r in person["reviews"]:
         reviewed.setdefault(r["pr_url"], r)
-    review_areas = Counter(r.get("pr_area", "Other") for r in reviewed.values())
+    review_areas = Counter(pr_classify.area_parent(r.get("pr_area") or "Docs & other") for r in reviewed.values())
+    review_children: dict[str, Counter] = defaultdict(Counter)
+    for r in reviewed.values():
+        area = r.get("pr_area") or "Docs & other"
+        review_children[pr_classify.area_parent(area)][pr_classify.area_child(area)] += 1
     review_types = Counter(r.get("pr_type", "Other change") for r in reviewed.values())
     review_lines = Counter()
     for r in reviewed.values():
-        review_lines[r.get("pr_area", "Other")] += r["pr_size"]
+        review_lines[pr_classify.area_parent(r.get("pr_area") or "Docs & other")] += r["pr_size"]
 
     return {
         "areas": areas,
@@ -1158,7 +1180,8 @@ def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
         "top_dirs": [{"dir": d, "lines": w, "prs": len(dir_prs[d])} for d, w in dirs.most_common(15)],
         "file_types": [{"ext": e, "files": n, "areas": dict(ext_areas[e].most_common())}
                        for e, n in exts.most_common(15)],
-        "review_areas": [{"area": a, "prs": n, "lines": review_lines[a]} for a, n in review_areas.most_common()],
+        "review_areas": [{"area": a, "prs": n, "lines": review_lines[a], "children": dict(review_children[a].most_common())}
+                         for a, n in review_areas.most_common()],
         "review_types": [{"type": t, "prs": n} for t, n in review_types.most_common()],
         "partial_prs": sum(1 for p in prs if p.get("files_partial")),
         "type_sources": dict(Counter(p.get("type_source", "none") for p in prs)),
@@ -1478,6 +1501,20 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
 
 
+def write_data_bundle(data_dir: Path) -> Path:
+    """Every JSON file of the report in one script, data/report-data.js.
+
+    Browsers refuse fetch() from file:// pages but do run <script src> from the
+    same folder, so index.html can be opened straight from disk with this file."""
+    files = {p.relative_to(data_dir).as_posix(): json.loads(p.read_text(encoding="utf-8"))
+             for p in sorted(data_dir.rglob("*.json"))}
+    # "</" would end the <script> element early if a PR title contained "</script>"
+    payload = json.dumps(files, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    bundle = data_dir / "report-data.js"
+    bundle.write_text(f"window.REPORT_DATA = {payload};\n", encoding="utf-8")
+    return bundle
+
+
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args: Any) -> None:
         if DEBUG:
@@ -1565,6 +1602,11 @@ def main(argv: list[str] | None = None) -> int:
         if not (folder / "index.html").is_file():
             log(f"ERROR: {args.view} is not a report folder (no index.html)")
             return 2
+        if not (folder / "data" / "report-data.js").is_file() and (folder / "data" / "manifest.json").is_file():
+            # older report: add the bundle and the current page so it also opens from disk
+            write_data_bundle(folder / "data")
+            shutil.copyfile(TEMPLATE, folder / "index.html")
+            log(f"added data/report-data.js: {folder / 'index.html'} now also opens without a server")
         serve(folder.resolve(), args.port, not args.no_open)
         return 0
 
@@ -1675,6 +1717,7 @@ def main(argv: list[str] | None = None) -> int:
                    "note": "PR classification is rule-based (pr_classify.py); no AI model is called."},
         },
     })
+    write_data_bundle(data_dir)
     shutil.copyfile(TEMPLATE, folder / "index.html")
     print(folder.resolve(), flush=True)
     log(f"wrote {folder.resolve()} ({gh.calls} GitHub API calls)", quiet=args.quiet)

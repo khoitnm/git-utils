@@ -139,11 +139,15 @@ reports/github-performance/<stamp>_v<DATA_VERSION>/      (gitignored)
   data/summary.json          metric definitions, metrics, ranks, scores for everyone
   data/org_baseline.json     anonymous org distributions
   data/users/<login>.json    raw per person: profile, PRs, reviews, commits, calendar, chart series
+  data/report-data.js        all of the above in one script, so index.html opens from file://
 ```
 
-The page loads the JSON with `fetch`, which browsers block on `file://`, so the script
-serves the folder on `127.0.0.1` and opens the browser. Ctrl+C stops the server. Use
-`--no-serve` for batch runs.
+`index.html` can be **opened straight from disk** (double-click, or copy the folder and send
+it). Browsers block `fetch()` on `file://` pages but still run a `<script src>` from the same
+folder, so every run also writes `data/report-data.js` with all the JSON in one file, and the
+page reads it from there. The script additionally serves the folder on `127.0.0.1` and opens
+the browser (Ctrl+C stops the server; `--no-serve` skips it). For reports made before
+`report-data.js` existed, `--view <folder>` adds it once.
 
 ## Caveats
 

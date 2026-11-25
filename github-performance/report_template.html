@@ -124,6 +124,9 @@ td.wrap { white-space: normal; text-align: left; max-width: 420px; }
 .scroll { overflow: auto; max-height: 520px; }
 td.score { font-weight: 600; }
 .muted { color: var(--text-secondary); }
+.parent-row td { font-weight: 600; border-top: 1px solid var(--border); }
+.child-row td:first-child { padding-left: 26px; }
+.child-row td { color: var(--text-secondary); }
 .group-row td { background: var(--surface-2); font-weight: 600; text-align: left; }
 
 /* charts */
@@ -164,6 +167,8 @@ input[type=search] { font: inherit; padding: 5px 10px; border: 1px solid var(--b
 </header>
 <main id="app"><p class="empty">Loading report data...</p></main>
 <div id="tip" role="tooltip"></div>
+<!-- All report data as one script: lets this page work from file:// (missing in old reports: then fetch is used) -->
+<script src="data/report-data.js"></script>
 
 <script>
 "use strict";
@@ -319,7 +324,7 @@ const COLUMN_TIPS = {
   "Score": "The percentile turned so that 100 is always the good end. Above 50 = better than typical, below 50 = worse. Blank = context-only metric.",
   "Direction": "Whether higher or lower is better. 'Context only' = neither; read it together with other numbers.",
   // work mix
-  "Area": "Part of the system a PR mainly changes (most changed lines; tests, docs and config give way to code).",
+  "Area": "Part of the system a PR mainly changes. Bold = top-level area (Backend, Frontend...), indented = its parts. A PR counts once, in the part with most of its real changes (tests, config and docs give way to code).",
   "Change type": "Why the PR was made, from its title, branch or files.",
   "PRs (main area)": "PRs whose main area is this one, and their share of all PRs. Each PR is counted once.",
   "PRs (main type)": "PRs of this change type, and their share of all PRs. Each PR is counted once.",
@@ -622,7 +627,14 @@ function renderMetrics(el, login) {
 
 // ------------------------------------------------------------------ what kind of work
 const heat = (v, max) => v ? `background: color-mix(in srgb, var(--series-1) ${Math.round(8 + 40 * v / Math.max(max, 1))}%, transparent)` : "";
-const catDesc = (kind, name) => (state.summary.categories?.[kind] || []).find(c => c.name === name)?.desc || "";
+const catDesc = (kind, name) => {
+  for (const c of state.summary.categories?.[kind] || []) {
+    if (c.name === name) return c.desc;
+    const child = (c.children || []).find(x => x.name === name);
+    if (child) return child.desc;
+  }
+  return "";
+};
 
 function shareCell(n, total) {
   const pct = total ? 100 * n / total : 0;
@@ -636,7 +648,7 @@ function mixTable(rows, kind, nameKey, total, extraHead = "", extraCell = () => 
   return `<div class="scroll"><table><thead><tr><th class="l">${kind === "areas" ? "Area" : "Change type"}</th>
     <th class="l">PRs (main ${kind === "areas" ? "area" : "type"})</th>${extraHead}<th>Merged</th><th>Lines +</th><th>Lines −</th>
     <th>Median size</th><th>Median open → merged</th><th>Repos</th><th>With tests</th></tr></thead><tbody>
-    ${rows.map(r => `<tr><td class="l" data-tip="${esc(catDesc(kind, r[nameKey]))}">${esc(r[nameKey])}</td>${shareCell(r.prs, total)}${extraCell(r)}
+    ${rows.map(r => `<tr class="${r.level === 0 ? "parent-row" : r.level === 1 ? "child-row" : ""}"><td class="l" data-tip="${esc(catDesc(kind, r[nameKey]))}">${r.level === 1 ? '<span class="muted">\u2514 </span>' : ""}${esc(r.label || r[nameKey])}</td>${shareCell(r.prs, total)}${extraCell(r)}
       <td>${fmt(r.merged)}</td><td>${fmt(r.additions)}</td><td>${fmt(r.deletions)}</td><td>${fmt(r.size_median)}</td>
       <td>${fmt(r.cycle_median_h, "hours")}</td><td>${fmt(r.repos)}</td><td>${r.prs ? Math.round(100 * r.with_tests / r.prs) + "%" : "–"}</td></tr>`).join("")}
     </tbody></table></div>`;
@@ -654,33 +666,34 @@ function renderMix(el, login) {
   const u = state.users[login], w = u.series.work_mix, p = state.summary.people.find(x => x.login === login);
   if (!w) { el.innerHTML = `<h2>What kind of work</h2><p class="empty">This report was generated before PR classification existed.</p>`; return; }
   const total = u.pull_requests.length;
-  const topAreas = w.areas.filter(a => a.prs).slice(0, 8).map(a => a.area);
+  const parents = w.areas.filter(a => a.level !== 1);
+  const topAreas = parents.filter(a => a.prs).map(a => a.area);
   const topTypes = w.types.slice(0, 8).map(t => t.type);
   const monthLabel = m => { const [y, mo] = m.split("-"); return MONTHS[mo - 1]; };
   const areaMonthRows = topAreas.map(a => ({ area: a, ...Object.fromEntries(w.area_monthly.map(m => [m.month, m[a] || 0])) }));
   const months = w.area_monthly.map(m => m.month);
   const crossRows = topTypes.map(t => ({ type: t, ...Object.fromEntries(w.type_by_area.filter(x => x.type === t).map(x => [x.area, x.prs])) }));
   const reviewedTotal = w.review_areas.reduce((a, r) => a + r.prs, 0);
-  const lead = w.areas[0], leadType = w.types[0];
+  const lead = parents[0], leadChild = w.areas.find(a => a.level === 1 && a.parent === lead?.area), leadType = w.types[0];
   el.innerHTML = `<h2>What kind of work</h2>
     <p class="sub">Every PR gets one <b>area</b> (the part of the system where most of its changed lines are; lock files and other generated files
       count as only a few lines) and one <b>change type</b> (from a conventional-commit prefix, the title, the branch name, then the files).
       Hover a name for its rule; the full list is at the bottom of the page.${w.partial_prs ? ` ${w.partial_prs} PR(s) changed over 100 files and were classified from their first 100.` : ""}</p>
     ${lead ? `<div class="tiles" style="margin-bottom:14px">
-      <div class="tile"><div class="label">Main area</div><div class="value" style="font-size:20px">${esc(lead.area)}</div><div class="rank">${lead.prs} of ${total} PRs · ${Math.round(100 * lead.line_share)}% of changed lines</div></div>
+      <div class="tile"><div class="label">Main area</div><div class="value" style="font-size:20px">${esc(lead.area)}</div><div class="rank">${lead.prs} of ${total} PRs \u00b7 ${Math.round(100 * lead.line_share)}% of changed lines${leadChild ? ` \u00b7 mostly ${esc(leadChild.label)}` : ""}</div></div>
       <div class="tile"><div class="label">Most common change</div><div class="value" style="font-size:20px">${esc(leadType.type)}</div><div class="rank">${leadType.prs} of ${total} PRs</div></div>
-      <div class="tile"><div class="label">Areas worked in</div><div class="value">${fmt(p.metrics.areas_worked)}</div><div class="rank">main area of at least one PR</div></div>
+      <div class="tile" data-tip="${esc(metricTip(state.defs.areas_worked))}"><div class="label">Areas worked in</div><div class="value">${fmt(p.metrics.areas_worked)}</div><div class="rank">top-level areas with at least one PR</div></div>
       <div class="tile" data-tip="${esc(metricTip(state.defs.tests_included_share))}"><div class="label">Code PRs that include tests</div><div class="value">${fmt(p.metrics.tests_included_share, "pct")}</div><div class="rank">${rankText(p.ranks.tests_included_share || {})}</div></div>
     </div>` : ""}
-    <h3 class="chart-title">By area</h3>
-    ${mixTable(w.areas.filter(a => a.prs || a.prs_touching), "areas", "area", total,
+    <h3 class="chart-title">By area <span class="muted" style="font-weight:400">(top-level areas in bold, with their parts below; each PR counts once)</span></h3>
+    ${mixTable(w.areas, "areas", "area", total,
       `<th>Touched by</th><th>Line share</th>`,
       r => `<td>${fmt(r.prs_touching)}</td><td>${Math.round(100 * r.line_share)}%</td>`)}
     <h3 class="chart-title" style="margin-top:18px">By change type</h3>
     ${mixTable(w.types, "types", "type", total)}
     <div class="grid2" style="margin-top:18px">
       <div><h3 class="chart-title">Main area by month (PRs opened)</h3>${heatTable(areaMonthRows, months, "area", "Area", monthLabel)}</div>
-      <div><h3 class="chart-title">Change type × area (PRs)</h3>${heatTable(crossRows, topAreas, "type", "Type \\ area", a => a.split(" ")[0])}</div>
+      <div><h3 class="chart-title">Change type × area (PRs)</h3>${heatTable(crossRows, topAreas, "type", "Type \\ area", a => a)}</div>
       <div><h3 class="chart-title">Most-changed directories (lines)</h3><div id="mix-dirs"></div></div>
       <div><h3 class="chart-title" data-tip="Every changed file in their PRs, by extension. Includes test, config and docs files: hover a bar to see which areas they belong to.">File types changed (number of files, incl. tests)</h3><div id="mix-ext"></div></div>
       <div><h3 class="chart-title">Areas of the PRs they review (${reviewedTotal} PRs)</h3><div id="mix-rev-areas"></div></div>
@@ -689,7 +702,8 @@ function renderMix(el, login) {
   hbars($("#mix-dirs", el), w.top_dirs, { label: r => r.dir, value: r => r.lines, tipFn: r => `${r.dir}\n${fmt(r.lines)} lines in ${r.prs} PR(s)` });
   hbars($("#mix-ext", el), w.file_types, { label: r => r.ext, value: r => r.files,
     tipFn: r => `${r.ext}: ${r.files} file change(s)\n` + Object.entries(r.areas || {}).map(([a, n]) => `${a}: ${n}`).join("\n") });
-  hbars($("#mix-rev-areas", el), w.review_areas, { label: r => r.area, value: r => r.prs, tipFn: r => `${r.area}\n${r.prs} PRs reviewed · ${fmt(r.lines)} lines` });
+  hbars($("#mix-rev-areas", el), w.review_areas, { label: r => r.area, value: r => r.prs,
+    tipFn: r => `${r.area}: ${r.prs} PRs reviewed \u00b7 ${fmt(r.lines)} lines\n` + Object.entries(r.children || {}).map(([c, n]) => `${c}: ${n}`).join("\n") });
   hbars($("#mix-rev-types", el), w.review_types, { label: r => r.type, value: r => r.prs });
 }
 
@@ -767,9 +781,11 @@ function renderGlossary(el) {
       Compare people with similar roles and tenure.</p>
     ${groups.map(g => `<h3 class="chart-title" style="margin-top:12px">${esc(g)}</h3><table><tbody>${
       s.metric_defs.filter(d => d.group === g).map(d => `<tr><td class="l" style="width:260px"><b>${esc(d.label)}</b></td><td class="wrap" style="max-width:none">${esc(d.desc)}${d.read ? `<br><span class="muted">How to read it: ${esc(d.read)}</span>` : ""}</td></tr>`).join("")}</tbody></table>`).join("")}
-    ${s.categories ? [["areas", "PR areas (first matching rule per file wins, in this order)"], ["types", "PR change types (first match wins, in this order)"]].map(([k, title]) =>
-      `<h3 class="chart-title" style="margin-top:12px">${title}</h3><table><tbody>${s.categories[k].map(c =>
-        `<tr><td class="l" style="width:260px"><b>${esc(c.name)}</b></td><td class="wrap" style="max-width:none">${esc(c.desc)}</td></tr>`).join("")}</tbody></table>`).join("") : ""}`;
+    ${s.categories ? `<h3 class="chart-title" style="margin-top:12px">PR areas (top-level area, then its parts)</h3><table><tbody>${
+      s.categories.areas.map(c => `<tr class="parent-row"><td class="l" style="width:260px">${esc(c.name)}</td><td class="wrap" style="max-width:none">${esc(c.desc)}</td></tr>` +
+        (c.children || []).map(x => `<tr class="child-row"><td class="l">${esc(x.short || x.name)}</td><td class="wrap" style="max-width:none">${esc(x.desc)}</td></tr>`).join("")).join("")}</tbody></table>
+      <h3 class="chart-title" style="margin-top:12px">PR change types (first match wins, in this order)</h3><table><tbody>${s.categories.types.map(c =>
+        `<tr><td class="l" style="width:260px"><b>${esc(c.name)}</b></td><td class="wrap" style="max-width:none">${esc(c.desc)}</td></tr>`).join("")}</tbody></table>` : ""}`;
 }
 
 // ------------------------------------------------------------------ wiring
@@ -783,6 +799,10 @@ function selectPerson(login) {
 }
 
 async function getJSON(path) {
+  // data/report-data.js (loaded above) carries every JSON file, so the page also
+  // works when opened straight from disk; over HTTP without it, fetch the file.
+  const key = path.replace(/^data\//, "");
+  if (window.REPORT_DATA && key in window.REPORT_DATA) return window.REPORT_DATA[key];
   const r = await fetch(path, { cache: "no-store" });
   if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
   return r.json();
@@ -796,8 +816,9 @@ async function load() {
     await Promise.all(state.manifest.people.map(async p => { state.users[p.login] = await getJSON("data/" + p.file); }));
   } catch (err) {
     $("#app").innerHTML = `<section class="card"><h2>Could not load the report data</h2>
-      <p>${esc(err.message)}</p><p class="sub">Browsers block reading JSON from <code>file://</code>. Serve this folder with
-      <code>python github_performance.py --view &lt;this folder&gt;</code> (or <code>python -m http.server</code> inside it).</p></section>`;
+      <p>${esc(err.message)}</p><p class="sub">The data file <code>data/report-data.js</code> next to this page is missing or unreadable (reports made before it existed
+      do not have it). Run <code>python github_performance.py --view &lt;this folder&gt;</code> once: it adds the file, after which this
+      page also opens straight from disk.</p></section>`;
     $("#meta").textContent = "";
     return;
   }

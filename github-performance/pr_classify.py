@@ -95,8 +95,66 @@ AREA_RULES: list[tuple[str, str, str]] = [
      "Server-side code (Java, Kotlin, C#, Python, Go...; .ts/.js outside UI repositories)."),
 ]
 AREA_RES = [(name, re.compile(rx, re.I)) for name, rx, _ in AREA_RULES]
-AREAS = [name for name, _, _ in AREA_RULES] + ["Other"]
-AREA_DESCRIPTIONS = {name: desc for name, _, desc in AREA_RULES} | {"Other": "Files no rule recognises."}
+KIND_DESCRIPTIONS = {name: desc for name, _, desc in AREA_RULES} | {"Other": "Files no rule recognises."}
+
+# The rules above decide what kind of file it is; the report groups those into a
+# parent / child tree. Tests and Configuration belong to Backend or Frontend,
+# depending on the file and the repository (see file_area).
+SEP = " \u203a "  # "Backend > Tests"
+AREA_TREE: list[tuple[str, str, list[str]]] = [
+    ("Backend", "Server-side work: business logic, APIs, jobs, database, its config and tests.",
+     ["Core logic", "APIs", "Scheduled jobs", "Database", "Configuration", "Tests"]),
+    ("Frontend", "UI work: components, styles, assets, UI config and UI tests.",
+     ["UI code", "Configuration", "Tests"]),
+    ("Infrastructure & delivery", "How the software is built, deployed and run.",
+     ["Infrastructure", "CI/CD pipelines"]),
+    ("Dependencies & build", "Library, framework and build-tool versions.", ["Dependencies & build"]),
+    ("Developer tooling", "Tools for developers rather than the product.",
+     ["AI & agent tooling", "Support tools & scripts"]),
+    ("Docs & other", "Documentation and files no rule recognises.", ["Docs", "Other"]),
+]
+PARENTS = [parent for parent, _, _ in AREA_TREE]
+PARENT_DESCRIPTIONS = {parent: desc for parent, desc, _ in AREA_TREE}
+AREAS = [parent + SEP + child for parent, _, children in AREA_TREE for child in children]
+# rule name -> (parent, child) when the parent does not depend on context
+KIND_TO_AREA = {
+    "AI & agent tooling": ("Developer tooling", "AI & agent tooling"),
+    "Support tools & scripts": ("Developer tooling", "Support tools & scripts"),
+    "Dependencies & build": ("Dependencies & build", "Dependencies & build"),
+    "CI/CD pipelines": ("Infrastructure & delivery", "CI/CD pipelines"),
+    "Infrastructure": ("Infrastructure & delivery", "Infrastructure"),
+    "Scheduled jobs": ("Backend", "Scheduled jobs"),
+    "Database": ("Backend", "Database"),
+    "APIs": ("Backend", "APIs"),
+    "Backend": ("Backend", "Core logic"),
+    "Frontend": ("Frontend", "UI code"),
+    "Docs": ("Docs & other", "Docs"),
+    "Other": ("Docs & other", "Other"),
+}
+CHILD_KIND = {"Core logic": "Backend", "UI code": "Frontend"}  # child -> rule whose description it uses
+# Tests / configuration that are front-end even outside a UI repository
+FRONTEND_TEST_RE = re.compile(r"\.(test|spec|cy)\.[jt]sx$|\.cy\.[jt]s$|(^|/)(cypress|playwright)[^/]*/|\.snap$|"
+                              r"(^|/)(jest|vitest|karma|cypress|playwright)\.config\.[^/]+$", re.I)
+FRONTEND_CONFIG_RE = re.compile(r"(^|/)\.(eslintrc|prettierrc|stylelintrc|babelrc|browserslistrc)[^/]*$|"
+                                r"(^|/)(tsconfig|vite\.config|webpack\.config|next\.config|tailwind\.config|"
+                                r"postcss\.config|angular|module-federation\.config)[^/]*$", re.I)
+
+
+def area_parent(area: str) -> str:
+    return area.split(SEP, 1)[0]
+
+
+def area_child(area: str) -> str:
+    return area.split(SEP, 1)[-1]
+
+
+def area_description(area: str) -> str:
+    if area in PARENT_DESCRIPTIONS:
+        return PARENT_DESCRIPTIONS[area]
+    parent, child = area_parent(area), area_child(area)
+    if child in ("Tests", "Configuration"):
+        return f"{parent} {child.lower()}: " + KIND_DESCRIPTIONS[child]
+    return KIND_DESCRIPTIONS[CHILD_KIND.get(child, child)]
 
 # Generated files count as a few lines, so one lock-file refresh does not make a
 # feature PR look like a dependency PR.
@@ -110,10 +168,28 @@ GENERATED_WEIGHT = 5
 CODE_FILE_RE = re.compile(BACKEND_EXT + "|" + SCRIPT_EXT + r"|\.(tsx|jsx|vue|svelte)$", re.I)
 
 
+def is_frontend_repo(repo: str | None) -> bool:
+    return bool(repo and FRONTEND_REPO_RE.search(repo.split("/")[-1]))
+
+
 def file_area(path: str, repo: str | None) -> str:
+    """The file's "Parent > Child" area."""
+    kind = file_kind(path, repo)
+    if kind == "Tests":
+        parent = "Frontend" if is_frontend_repo(repo) or FRONTEND_TEST_RE.search(path) else "Backend"
+        return parent + SEP + "Tests"
+    if kind == "Configuration":
+        parent = "Frontend" if is_frontend_repo(repo) or FRONTEND_CONFIG_RE.search(path) else "Backend"
+        return parent + SEP + "Configuration"
+    parent, child = KIND_TO_AREA[kind]
+    return parent + SEP + child
+
+
+def file_kind(path: str, repo: str | None) -> str:
+    """Which AREA_RULES rule the file matches (first one wins)."""
     p = path.replace("\\", "/")
     for name, rx in AREA_RES:
-        if name == "Backend" and re.search(SCRIPT_EXT, p, re.I) and repo and FRONTEND_REPO_RE.search(repo.split("/")[-1]):
+        if name == "Backend" and re.search(SCRIPT_EXT, p, re.I) and is_frontend_repo(repo):
             return "Frontend"
         if name == "Configuration" and CODE_FILE_RE.search(p):
             continue
@@ -195,33 +271,35 @@ TYPE_DESCRIPTIONS = {name: desc for name, _, desc in TYPE_RULES} | {
     PRODUCT_TYPE: "Code change whose title gives no hint (often a ticket number alone); decided by the files.",
     "Other change": "Nothing in the title, branch or files says what kind of change it is."}
 
-# PRs that are mostly tooling are tooling work whatever verb the title uses.
-TOOLING_AREAS = {"AI & agent tooling", "Support tools & scripts"}
-CODE_AREAS = {"Backend", "Frontend", "APIs", "Scheduled jobs", "Database"}
+# Parents whose work is the product itself: an unlabelled PR there is a product change.
+PRODUCT_PARENTS = {"Backend", "Frontend"}
 
-# When the title says nothing, the files decide.
+# When the title says nothing, the files decide (keyed by child area).
 AREA_DEFAULT_TYPE = {
     "Dependencies & build": "Dependency & platform upgrade", "Tests": "Tests", "Docs": "Docs",
     "CI/CD pipelines": "CI/CD & build", "Infrastructure": "CI/CD & build", "Configuration": "Configuration",
     "AI & agent tooling": TOOLING_TYPE, "Support tools & scripts": TOOLING_TYPE,
 }
 # Areas that support a change rather than being the change itself.
-SUPPORTING_AREAS = {"Tests", "Docs", "Configuration", "Other"}
+SUPPORTING_CHILDREN = {"Tests", "Docs", "Configuration", "Other"}
 MAIN_AREA_MIN_SHARE = 0.10
 
 
-def change_type(title: str, branch: str | None, primary_area: str, areas: dict[str, int]) -> tuple[str, str]:
-    """(type, what decided it)."""
+def change_type(title: str, branch: str | None, main_area: str, areas: dict[str, int]) -> tuple[str, str]:
+    """(type, what decided it). main_area / areas use "Parent > Child" names."""
+    parent, child = area_parent(main_area), area_child(main_area)
     match = CONVENTIONAL_RE.match(title or "")
     if match and match.group(1).lower() in CONVENTIONAL_TYPES:
         kind = CONVENTIONAL_TYPES[match.group(1).lower()]
-        if kind != "Feature" or primary_area != "Dependencies & build":
+        if kind != "Feature" or parent != "Dependencies & build":
             return kind, "conventional prefix"
-    # A PR that only touches manifests is an upgrade, whatever its title says.
     total = sum(areas.values()) or 1
-    if areas.get("Dependencies & build", 0) / total >= 0.8:
+    share = lambda p: sum(w for a, w in areas.items() if area_parent(a) == p) / total  # noqa: E731
+    # A PR that only touches manifests is an upgrade, whatever its title says.
+    if share("Dependencies & build") >= 0.8:
         return "Dependency & platform upgrade", "files"
-    if primary_area in TOOLING_AREAS and sum(areas.get(a, 0) for a in TOOLING_AREAS) / total >= 0.6:
+    # A PR that is mostly tooling is tooling work, whatever verb its title uses.
+    if parent == "Developer tooling" and share("Developer tooling") >= 0.6:
         return TOOLING_TYPE, "files"
     text = TICKET_RE.sub(" ", title or "")
     branch_text = re.sub(r"[/_.-]+", " ", TICKET_RE.sub(" ", branch or ""))
@@ -229,9 +307,9 @@ def change_type(title: str, branch: str | None, primary_area: str, areas: dict[s
         for name, rx in TYPE_RES:
             if rx.search(value):
                 return name, source
-    if primary_area in AREA_DEFAULT_TYPE:
-        return AREA_DEFAULT_TYPE[primary_area], "files"
-    if primary_area in CODE_AREAS:
+    if child in AREA_DEFAULT_TYPE:
+        return AREA_DEFAULT_TYPE[child], "files"
+    if parent in PRODUCT_PARENTS:
         return PRODUCT_TYPE, "files"
     return "Other change", "none"
 
@@ -241,37 +319,54 @@ def change_type(title: str, branch: str | None, primary_area: str, areas: dict[s
 # --------------------------------------------------------------------------- #
 def classify_pr(repo: str | None, title: str, branch: str | None, files: list[dict],
                 changed_files: int | None = None) -> dict[str, Any]:
-    """Area weights (lines, generated files damped), primary area, change type.
+    """Area weights per "Parent > Child" (lines, generated files damped), the main
+    parent and child area, and the change type.
 
+    The main parent is where the PR's real changes are: tests, config, docs and
+    unknown files only decide when nothing else reaches MAIN_AREA_MIN_SHARE of
+    the lines (a PR with 300 test lines and 40 backend lines is Backend > Core
+    logic; an upgrade that mostly adjusts tests is Dependencies & build).
     `files` are {path, additions, deletions}; GitHub returns at most the first
-    100, so a huge PR is classified from those (files_seen < changed_files)."""
+    100, so a huge PR is classified from those (files_partial)."""
     areas: Counter = Counter()
     for f in files:
         areas[file_area(f["path"], repo)] += file_weight(f["path"], f.get("additions", 0), f.get("deletions", 0))
     if not areas:  # no file list (deleted repo, or a PR with nothing in it)
-        areas["Other"] = 1
-    primary = areas.most_common(1)[0][0]
-    if primary in SUPPORTING_AREAS:
-        # Tests, docs and config usually outweigh the code they go with: a PR with
-        # 300 test lines and 40 backend lines is a backend change.
-        total = sum(areas.values())
-        code = [(a, w) for a, w in areas.most_common() if a not in SUPPORTING_AREAS]
-        if code and code[0][1] >= MAIN_AREA_MIN_SHARE * total:
-            primary = code[0][0]
-    kind, decided_by = change_type(title, branch, primary, areas)
+        areas["Docs & other" + SEP + "Other"] = 1
+    total = sum(areas.values())
+    parents: Counter = Counter()
+    code: Counter = Counter()
+    for area, weight in areas.items():
+        parents[area_parent(area)] += weight
+        if area_child(area) not in SUPPORTING_CHILDREN:
+            code[area_parent(area)] += weight
+    if code and code.most_common(1)[0][1] >= MAIN_AREA_MIN_SHARE * total:
+        main_parent = code.most_common(1)[0][0]
+        candidates = [(a, w) for a, w in areas.most_common()
+                      if area_parent(a) == main_parent and area_child(a) not in SUPPORTING_CHILDREN]
+    else:
+        main_parent = parents.most_common(1)[0][0]
+        candidates = [(a, w) for a, w in areas.most_common() if area_parent(a) == main_parent]
+    main = candidates[0][0]
+    kind, decided_by = change_type(title, branch, main, areas)
     return {
-        "area": primary,
+        "area": main,
+        "area_parent": main_parent,
         "areas": dict(areas.most_common()),
+        "area_parents": dict(parents.most_common()),
         "type": kind,
         "type_source": decided_by,
-        "touches_tests": areas.get("Tests", 0) > 0,
+        "touches_tests": any(area_child(a) == "Tests" for a in areas),
         "files_seen": len(files),
         "files_partial": bool(changed_files and changed_files > len(files)),
     }
 
 
-def category_defs() -> dict[str, list[dict[str, str]]]:
+def category_defs() -> dict[str, list[dict[str, Any]]]:
     return {
-        "areas": [{"name": a, "desc": AREA_DESCRIPTIONS[a]} for a in AREAS],
+        "areas": [{"name": parent, "desc": desc,
+                   "children": [{"name": parent + SEP + child, "short": child,
+                                 "desc": area_description(parent + SEP + child)} for child in children]}
+                  for parent, desc, children in AREA_TREE],
         "types": [{"name": t, "desc": TYPE_DESCRIPTIONS[t]} for t in TYPES],
     }
