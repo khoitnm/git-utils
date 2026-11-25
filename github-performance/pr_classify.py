@@ -66,8 +66,10 @@ AREA_RULES: list[tuple[str, str, str]] = [
     ("APIs",
      r"(openapi|swagger)[^/]*\.(ya?ml|json)$|(^|/)(openapi|swagger|api-?specs?|contracts?|proto|protos|"
      r"graphql|schemas?/api)/|\.(proto|graphqls?|gql|avsc|raml|wsdl)$|"
-     r"[^/]*(controller|resource|endpoint|endpoints|router|routes|handler|api|apis|client|grpc)"
-     r"[^/]*\.(java|kt|cs|py|go|scala|groovy)$",
+     # name *ends* with the role (UserController.java, CoreClient.java, api.py), so
+     # CoreApiConfig.java or RapidSync.java stay Backend
+     r"(controller|controllers|resource|resources|endpoint|endpoints|router|routes|handler|handlers|"
+     r"api|apis|client|grpc|grpcservice)\.(java|kt|cs|py|go|scala|groovy)$",
      "API contracts (OpenAPI, proto, GraphQL) and the API layer: controllers, resources, handlers, clients."),
     ("Docs",
      r"\.(md|mdx|rst|adoc|asciidoc|txt)$|(^|/)(docs?|documentation|wiki|adr|adrs)/|(^|/)(license|changelog|"
@@ -86,7 +88,8 @@ AREA_RULES: list[tuple[str, str, str]] = [
      r"(^|/)application[^/]*\.(ya?ml|properties)$|\.(properties|ya?ml|toml|ini|conf|cfg|env|json|xml)$|"
      r"(^|/)(config|configs|conf|settings|resources)/|(^|/)\.env[^/]*$|(^|/)\.(editorconfig|gitignore|"
      r"gitattributes|prettierrc[^/]*|eslintrc[^/]*|stylelintrc[^/]*|babelrc)$",
-     "Application and tool configuration (YAML, properties, JSON, lint / format settings)."),
+     "Application and tool configuration (YAML, properties, JSON, lint / format settings). "
+     "Source code in a config/ package is Backend, not configuration."),
     ("Backend",
      BACKEND_EXT + "|" + SCRIPT_EXT,
      "Server-side code (Java, Kotlin, C#, Python, Go...; .ts/.js outside UI repositories)."),
@@ -103,11 +106,17 @@ GENERATED_RE = re.compile(r"(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.
 GENERATED_WEIGHT = 5
 
 
+# Source code is never "configuration", even in a config/ package (SomethingConfig.java).
+CODE_FILE_RE = re.compile(BACKEND_EXT + "|" + SCRIPT_EXT + r"|\.(tsx|jsx|vue|svelte)$", re.I)
+
+
 def file_area(path: str, repo: str | None) -> str:
     p = path.replace("\\", "/")
     for name, rx in AREA_RES:
         if name == "Backend" and re.search(SCRIPT_EXT, p, re.I) and repo and FRONTEND_REPO_RE.search(repo.split("/")[-1]):
             return "Frontend"
+        if name == "Configuration" and CODE_FILE_RE.search(p):
+            continue
         if rx.search(p):
             return name
     return "Other"

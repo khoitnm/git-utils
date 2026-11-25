@@ -78,6 +78,9 @@ Searches over 1000 results are split by date automatically.
 | Consistency | total activity, active days, active weeks, longest streak, weekend share |
 
 Full definitions are in `METRIC_DEFS` in the script and at the bottom of every report.
+Every metric also has a short "how to read it" line (`METRIC_READ`) that says when a value is
+good, bad or only context. In the report, hovering a metric shows its definition and that
+line, and hovering any table column header shows what the column means.
 
 ## What kind of work (`pr_classify.py`)
 

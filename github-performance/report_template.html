@@ -296,6 +296,75 @@ function calendar(el, days) {
   el.appendChild(lg);
 }
 
+// "<definition>\nHow to read it: <good / bad>" for any metric
+const metricTip = d => d ? `${d.label}: ${d.desc}${d.read ? `\nHow to read it: ${d.read}` : ""}` : "";
+
+// What every table column means and how to read it, keyed by the header text.
+const COLUMN_TIPS = {
+  // overview
+  "Person": "The person analysed. 'peer' = added only for comparison.",
+  "Compared over": "The days their numbers are compared on. Shorter than the report window for people who joined during it.",
+  "Delivery": "Group score 0-100: average percentile of the delivery metrics (PRs, merges, size, speed). 50 = typical, higher = better.",
+  "Quality & process": "Group score 0-100: description, tests, change requests, self-merges. 50 = typical, higher = better.",
+  "Code review": "Group score 0-100: how much and how well they review others' PRs. 50 = typical, higher = better.",
+  "Collaboration": "Group score 0-100: breadth of people and repos they help. 50 = typical, higher = better.",
+  "Consistency": "Group score 0-100: how steady their activity is. 50 = typical, higher = better.",
+  // all metrics
+  "Metric": "Hover a metric name for its definition and how to read it.",
+  "Value": "This person's number over the whole report window.",
+  "Cohort median": "Middle value of the people in this report, over the same days. Half are above, half below.",
+  "Cohort pct": "Percentile among the people in this report: P75 = higher than 75% of them. Not good or bad by itself; see Direction.",
+  "Org median": "Middle value of active company members over the same days.",
+  "Org pct": "Percentile among active company members: P75 = higher than 75% of them. Not good or bad by itself; see Direction.",
+  "Score": "The percentile turned so that 100 is always the good end. Above 50 = better than typical, below 50 = worse. Blank = context-only metric.",
+  "Direction": "Whether higher or lower is better. 'Context only' = neither; read it together with other numbers.",
+  // work mix
+  "Area": "Part of the system a PR mainly changes (most changed lines; tests, docs and config give way to code).",
+  "Change type": "Why the PR was made, from its title, branch or files.",
+  "PRs (main area)": "PRs whose main area is this one, and their share of all PRs. Each PR is counted once.",
+  "PRs (main type)": "PRs of this change type, and their share of all PRs. Each PR is counted once.",
+  "Touched by": "PRs with at least one file in this area, even if their main area is another. Higher than the main count means it is often a side change.",
+  "Line share": "Share of all changed lines (lock and generated files count as a few lines). Shows where the volume goes.",
+  "Merged": "How many of those PRs are merged. Much lower than the PR count means work is open or abandoned.",
+  "Lines +": "Lines added by those PRs. Volume only, not value.",
+  "Lines −": "Lines deleted by those PRs. Deleting code is often good.",
+  "Median size": "Typical PR size (lines added + deleted). Lower is easier to review; above ~400 is large.",
+  "Median open → merged": "Typical time from opening to merging. Lower is better; hours to a few days is healthy.",
+  "Repos": "Distinct repositories those PRs are in.",
+  "With tests": "Share of those PRs that also change test files. Higher is better for code changes.",
+  "Type \\ area": "Rows: change type. Columns: main area. Each cell = PRs of that type in that area; darker = more.",
+  "Total": "PRs in this row.",
+  // PR list
+  "Repo": "Repository the PR is in.",
+  "Title": "PR title; click the number to open it on GitHub.",
+  "Type": "Why the PR was made, from its title, branch or files.",
+  "State": "MERGED, OPEN or CLOSED (closed without merging).",
+  "Opened": "Date the PR was opened.",
+  "Lines": "Lines added + deleted. Smaller PRs are easier to review.",
+  "Files": "Files changed.",
+  "Commits": "Commits on the PR branch. Many can mean long iteration or rework.",
+  "Open → merged": "Time from opening to merging. Lower is better; blank = not merged.",
+  "Human reviews": "Reviews by people other than the author (bots excluded). 0 on a merged PR means nobody reviewed it.",
+  "Merged by": "Who clicked merge. The author merging their own unapproved PR is a process risk.",
+  // reviews given
+  "Submitted": "When they submitted the review.",
+  "PR": "The PR they reviewed; click to open it.",
+  "Author": "Who wrote the PR.",
+  "Outcome": "APPROVED, CHANGES_REQUESTED (blocking feedback) or COMMENTED (feedback without a verdict).",
+  "Inline comments": "Line comments in this review. 0 on an approval with no other comment = silent approval.",
+  "PR lines": "Size of the reviewed PR. Large PRs approved within minutes deserve a second look.",
+  "Hours after PR opened": "How soon they reviewed after the PR was opened. Lower unblocks teammates sooner.",
+  // run cost
+  "Stored data reused": "Whether data saved by an earlier run (same data version) was reused instead of fetched again.",
+  "Ranges fetched this run": "Date ranges fetched from GitHub this time. 'none' = everything came from stored data.",
+};
+// Table headers are rendered in many places: fill their tooltips from COLUMN_TIPS.
+const headerName = th => th.textContent.replace(/\s+/g, " ").trim();
+new MutationObserver(() => document.querySelectorAll("#app th").forEach(th => {
+  const tip = COLUMN_TIPS[headerName(th)];
+  if (tip && th.getAttribute("data-tip") !== tip) th.setAttribute("data-tip", tip);
+})).observe(document.getElementById("app"), { childList: true, subtree: true });
+
 const baselineFor = p => state.baselines[p.comparison?.org_file] || null;
 const joinedLate = p => p.comparison && p.comparison.from !== state.summary.from;
 const windowText = p => `${date10(p.comparison.from)} \u2192 ${date10(p.comparison.to)} (${p.comparison.days} days)`;
@@ -312,7 +381,7 @@ function distStrip(el, rows, { who, population, n, medianLabel = "median" }) {
     const row = document.createElement("div");
     row.className = "strip-row";
     row.innerHTML = `
-      <div><div>${esc(d.label)}</div><div class="muted" style="font-size:12px">${medianLabel} ${fmt(b.median, d.unit)}</div></div>
+      <div data-tip="${esc(d.tip || d.label)}"><div>${esc(d.label)}</div><div class="muted" style="font-size:12px">${medianLabel} ${fmt(b.median, d.unit)}</div></div>
       <div style="position:relative;height:26px" data-tip="${esc(`${d.label}\n${who}: ${fmt(value, d.unit)} (${fmtPct(d.pct)} of ${n} ${population})\np25 ${fmt(b.p25, d.unit)} · median ${fmt(b.median, d.unit)} · p75 ${fmt(b.p75, d.unit)} · p90 ${fmt(b.p90, d.unit)} · max ${fmt(b.max, d.unit)}`)}">
         <div style="position:absolute;left:0;right:0;top:12px;height:2px;background:var(--grid)"></div>
         <div style="position:absolute;left:${pos(b.p25)};width:calc(${pos(b.p75)} - ${pos(b.p25)});top:7px;height:12px;background:var(--band);border-radius:3px"></div>
@@ -337,7 +406,7 @@ function orgStrip(el, metrics, person) {
   const base = baselineFor(person);
   const rows = metrics.filter(d => base?.metrics?.[d.key]).map(d => {
     const r = person.ranks[d.key] || {};
-    return { label: d.label, unit: d.unit, value: r.org_value ?? person.metrics[d.key], pct: r.org_pct, stats: base.metrics[d.key] };
+    return { label: d.label, tip: metricTip(d), unit: d.unit, value: r.org_value ?? person.metrics[d.key], pct: r.org_pct, stats: base.metrics[d.key] };
   });
   if (!rows.length) { el.innerHTML = `<p class="empty">No organisation baseline in this report (run without --no-baseline).</p>`; return; }
   distStrip(el, rows, { who: person.login, population: "active members", n: base.active_members, medianLabel: "org median" });
@@ -351,7 +420,9 @@ function renderTenure(el, login) {
   const rateUnit = d => d.unit === "count" ? "num" : d.unit;
   const rows = state.summary.metric_defs.filter(d => t.metrics[d.key]).map(d => {
     const m = t.metrics[d.key];
-    return { label: d.key === "review_ratio" ? d.label : `${d.label} / ${t.rate_days} days`, unit: rateUnit(d), value: m.value, pct: m.pct, stats: m };
+    return { label: d.key === "review_ratio" ? d.label : `${d.label} / ${t.rate_days} days`,
+             tip: metricTip(d) + (d.key === "review_ratio" ? "" : `\nHere: per ${t.rate_days} days of their time in the window.`),
+             unit: rateUnit(d), value: m.value, pct: m.pct, stats: m };
   });
   el.innerHTML = `<h2>Compared with members of similar tenure <span class="muted" style="font-weight:400">· in the company ${tenureText(t.tenure_days)}</span></h2>
     <p class="sub">Members who have been in <b>${esc(state.summary.org.login)}</b> between ${tenureText(t.range_days[0])} and ${tenureText(t.range_days[1])}
@@ -403,7 +474,7 @@ function renderOverview(el) {
       <thead><tr><th class="l" data-k="login">Person</th>
         <th class="l" data-k="window" data-tip="People who joined during the window are compared over the same days only, with members who were already there">Compared over</th>
         ${groups.map(g => `<th data-k="g:${esc(g)}">${esc(g)}</th>`).join("")}
-        ${OVERVIEW_COLS.map(k => `<th data-k="${k}" data-tip="${esc(state.defs[k].desc)}">${esc(state.defs[k].label)}</th>`).join("")}
+        ${OVERVIEW_COLS.map(k => `<th data-k="${k}" data-tip="${esc(metricTip(state.defs[k]))}">${esc(state.defs[k].label)}</th>`).join("")}
       </tr></thead><tbody></tbody></table></div>`;
   let sortKey = "login", asc = true;
   const val = (p, k) => k === "login" ? p.login.toLowerCase() : k === "window" ? p.comparison.days : k.startsWith("g:") ? p.group_scores[k.slice(2)] : p.metrics[k];
@@ -477,7 +548,7 @@ function renderPerson(el, login) {
     </div>
     <div class="tiles">
       ${TILES.map(k => { const d = state.defs[k], r = p.ranks[k] || {};
-        return `<div class="tile" data-tip="${esc(d.desc)}"><div class="label">${esc(d.label)}</div>
+        return `<div class="tile" data-tip="${esc(metricTip(d))}"><div class="label">${esc(d.label)}</div>
           <div class="value">${fmt(p.metrics[k], d.unit)}</div><div class="rank">${rankText(r)}</div></div>`; }).join("")}
     </div>`;
 }
@@ -541,7 +612,7 @@ function renderMetrics(el, login) {
         s.metric_defs.filter(d => d.group === g).map(d => {
           const r = p.ranks[d.key] || {}, b = base?.metrics?.[d.key];
           const score = r.cohort_score ?? r.org_score;
-          return `<tr><td class="l" data-tip="${esc(d.desc)}">${esc(d.label)}</td><td><b>${fmt(p.metrics[d.key], d.unit)}</b></td>
+          return `<tr><td class="l" data-tip="${esc(metricTip(d))}">${esc(d.label)}</td><td><b>${fmt(p.metrics[d.key], d.unit)}</b></td>
             ${multi ? `<td>${fmt(p.comparison.cohort_median[d.key], d.unit)}</td><td>${fmtPct(r.cohort_pct)}</td>` : ""}
             ${base ? `<td>${b ? fmt(b.median, d.unit) : "–"}</td><td>${fmtPct(r.org_pct)}</td>` : ""}
             <td class="score" style="${scoreStyle(score)}">${score === undefined || score === null ? "–" : Math.round(score)}</td>
@@ -599,11 +670,11 @@ function renderMix(el, login) {
       <div class="tile"><div class="label">Main area</div><div class="value" style="font-size:20px">${esc(lead.area)}</div><div class="rank">${lead.prs} of ${total} PRs · ${Math.round(100 * lead.line_share)}% of changed lines</div></div>
       <div class="tile"><div class="label">Most common change</div><div class="value" style="font-size:20px">${esc(leadType.type)}</div><div class="rank">${leadType.prs} of ${total} PRs</div></div>
       <div class="tile"><div class="label">Areas worked in</div><div class="value">${fmt(p.metrics.areas_worked)}</div><div class="rank">main area of at least one PR</div></div>
-      <div class="tile" data-tip="${esc(state.defs.tests_included_share?.desc || "")}"><div class="label">Code PRs that include tests</div><div class="value">${fmt(p.metrics.tests_included_share, "pct")}</div><div class="rank">${rankText(p.ranks.tests_included_share || {})}</div></div>
+      <div class="tile" data-tip="${esc(metricTip(state.defs.tests_included_share))}"><div class="label">Code PRs that include tests</div><div class="value">${fmt(p.metrics.tests_included_share, "pct")}</div><div class="rank">${rankText(p.ranks.tests_included_share || {})}</div></div>
     </div>` : ""}
     <h3 class="chart-title">By area</h3>
     ${mixTable(w.areas.filter(a => a.prs || a.prs_touching), "areas", "area", total,
-      `<th data-tip="PRs with at least one changed file in this area, whatever their main area">Touched by</th><th data-tip="Share of all changed lines (generated files damped)">Line share</th>`,
+      `<th>Touched by</th><th>Line share</th>`,
       r => `<td>${fmt(r.prs_touching)}</td><td>${Math.round(100 * r.line_share)}%</td>`)}
     <h3 class="chart-title" style="margin-top:18px">By change type</h3>
     ${mixTable(w.types, "types", "type", total)}
@@ -611,12 +682,13 @@ function renderMix(el, login) {
       <div><h3 class="chart-title">Main area by month (PRs opened)</h3>${heatTable(areaMonthRows, months, "area", "Area", monthLabel)}</div>
       <div><h3 class="chart-title">Change type × area (PRs)</h3>${heatTable(crossRows, topAreas, "type", "Type \\ area", a => a.split(" ")[0])}</div>
       <div><h3 class="chart-title">Most-changed directories (lines)</h3><div id="mix-dirs"></div></div>
-      <div><h3 class="chart-title">File types changed (files)</h3><div id="mix-ext"></div></div>
+      <div><h3 class="chart-title" data-tip="Every changed file in their PRs, by extension. Includes test, config and docs files: hover a bar to see which areas they belong to.">File types changed (number of files, incl. tests)</h3><div id="mix-ext"></div></div>
       <div><h3 class="chart-title">Areas of the PRs they review (${reviewedTotal} PRs)</h3><div id="mix-rev-areas"></div></div>
       <div><h3 class="chart-title">Kinds of PRs they review</h3><div id="mix-rev-types"></div></div>
     </div>`;
   hbars($("#mix-dirs", el), w.top_dirs, { label: r => r.dir, value: r => r.lines, tipFn: r => `${r.dir}\n${fmt(r.lines)} lines in ${r.prs} PR(s)` });
-  hbars($("#mix-ext", el), w.file_types, { label: r => r.ext, value: r => r.files });
+  hbars($("#mix-ext", el), w.file_types, { label: r => r.ext, value: r => r.files,
+    tipFn: r => `${r.ext}: ${r.files} file change(s)\n` + Object.entries(r.areas || {}).map(([a, n]) => `${a}: ${n}`).join("\n") });
   hbars($("#mix-rev-areas", el), w.review_areas, { label: r => r.area, value: r => r.prs, tipFn: r => `${r.area}\n${r.prs} PRs reviewed · ${fmt(r.lines)} lines` });
   hbars($("#mix-rev-types", el), w.review_types, { label: r => r.type, value: r => r.prs });
 }
@@ -682,10 +754,9 @@ function renderCost(el) {
         <div class="rank">${ai.used ? `${fmt(ai.input_tokens)} in / ${fmt(ai.output_tokens)} out · ${esc(ai.model)}` : "no AI model is called"}</div></div>
       <div class="tile"><div class="label">AI cost</div><div class="value">$${(ai.cost_usd || 0).toFixed(2)}</div><div class="rank">${esc(ai.note || "")}</div></div>
     </div>
-    ${per.length ? `<div class="scroll"><table><thead><tr><th class="l">Person</th><th class="l">Stored data reused</th><th class="l">Ranges fetched this run</th><th>Open PRs refreshed</th><th>API calls</th></tr></thead><tbody>
+    ${per.length ? `<div class="scroll"><table><thead><tr><th class="l">Person</th><th class="l">Stored data reused</th><th class="l">Ranges fetched this run</th></tr></thead><tbody>
       ${per.map(([login, f]) => f ? `<tr><td class="l">${esc(login)}</td><td class="l">${f.reused_store ? "yes" : "no (first run or new version)"}</td>
-        <td class="l">${f.ranges.length ? f.ranges.map(r => `${r[0]} → ${r[1]}`).join(", ") : "none (all stored)"}</td>
-        <td>${fmt(f.open_prs_refreshed)}</td><td>${fmt(f.api_calls)}</td></tr>` : "").join("")}</tbody></table></div>` : ""}`;
+        <td class="l">${f.ranges.length ? f.ranges.map(r => `${r[0]} → ${r[1]}`).join(", ") : "none (all stored)"}</td></tr>` : "").join("")}</tbody></table></div>` : ""}`;
 }
 
 function renderGlossary(el) {
@@ -695,7 +766,7 @@ function renderGlossary(el) {
       on-call, design, mentoring, meetings and JIRA work do not show up here, and volume metrics (lines, commits) are easy to inflate.
       Compare people with similar roles and tenure.</p>
     ${groups.map(g => `<h3 class="chart-title" style="margin-top:12px">${esc(g)}</h3><table><tbody>${
-      s.metric_defs.filter(d => d.group === g).map(d => `<tr><td class="l" style="width:260px"><b>${esc(d.label)}</b></td><td class="wrap" style="max-width:none">${esc(d.desc)}</td></tr>`).join("")}</tbody></table>`).join("")}
+      s.metric_defs.filter(d => d.group === g).map(d => `<tr><td class="l" style="width:260px"><b>${esc(d.label)}</b></td><td class="wrap" style="max-width:none">${esc(d.desc)}${d.read ? `<br><span class="muted">How to read it: ${esc(d.read)}</span>` : ""}</td></tr>`).join("")}</tbody></table>`).join("")}
     ${s.categories ? [["areas", "PR areas (first matching rule per file wins, in this order)"], ["types", "PR change types (first match wins, in this order)"]].map(([k, title]) =>
       `<h3 class="chart-title" style="margin-top:12px">${title}</h3><table><tbody>${s.categories[k].map(c =>
         `<tr><td class="l" style="width:260px"><b>${esc(c.name)}</b></td><td class="wrap" style="max-width:none">${esc(c.desc)}</td></tr>`).join("")}</tbody></table>`).join("") : ""}`;

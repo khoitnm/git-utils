@@ -600,7 +600,7 @@ METRIC_DEFS: list[dict[str, Any]] = [
     {"key": "comments_per_review", "group": "Code review", "label": "Comments per review", "unit": "num",
      "better": "up", "desc": "Inline comments per review given: depth of review."},
     {"key": "silent_approval_share", "group": "Code review", "label": "Silent approvals", "unit": "pct",
-     "better": "down", "desc": "Approvals with no comment and no body. Very high values can mean rubber-stamping."},
+     "better": "down", "desc": "Approvals on PRs where the person wrote no comment in any of their reviews."},
     {"key": "review_turnaround_median_h", "group": "Code review", "label": "Review turnaround (median)",
      "unit": "hours", "better": "down",
      "desc": "Hours from a PR being opened to this person's first review on it (median)."},
@@ -633,6 +633,57 @@ METRIC_DEFS: list[dict[str, Any]] = [
      "desc": "Share of activity on Saturday/Sunday. A workload signal, not a goal."},
 ]
 
+
+# How to read each metric: when a value is good, bad, or only context. Shown in
+# the report's tooltips next to the definition.
+METRIC_READ = {
+    "prs_opened": "Higher usually means more shipped work, but many tiny PRs inflate it. Read it with PR size.",
+    "prs_merged": "Higher is better: work that actually landed. Far below 'PRs opened' means work is stalling.",
+    "merge_rate": "Near 90-100% is healthy. Low means many PRs are abandoned or rejected; ask why.",
+    "prs_open_now": "Context only. A few is normal; many old open PRs suggest blocked or forgotten work.",
+    "commits": "More is not better on its own: commit habits differ (squash merges count as one).",
+    "commits_in_prs": "Context only. Shows iteration before merge; very high per PR can mean rework.",
+    "repos_contributed": "Higher means broader reach. Low is fine for someone focused on one service.",
+    "areas_worked": "Context only. High = generalist, low = specialist. Neither is better.",
+    "feature_pr_share": "Context only. Depends on the team's roadmap phase.",
+    "bugfix_pr_share": "Context only. High can mean owning support / stability work, not poor quality.",
+    "dependency_pr_share": "Context only. High often means owning upgrades and security fixes: needed but less visible.",
+    "lines_added": "Volume only. Never read more lines as better work.",
+    "lines_deleted": "Volume only. Deleting code is often a good thing.",
+    "pr_size_median": "Lower is better: small PRs get reviewed faster and break less. Above ~400 lines is large.",
+    "small_pr_share": "Higher is better. Above ~60% is a good habit.",
+    "cycle_time_median_h": "Lower is better: work reaches users sooner. Days, not weeks, is healthy; it also depends on reviewers.",
+    "cycle_time_p75_h": "Lower is better. A long tail means some PRs wait a long time; look at which ones.",
+    "time_to_first_review_median_h": "Context only: mostly how fast the team reviews, not this person.",
+    "reviews_received_per_pr": "Context only. 1-2 is typical; 0 means PRs merge without review.",
+    "changes_requested_share": "Lower is usually better, but some requested changes are normal on hard work.",
+    "self_merged_unapproved": "Lower is better. Should be near 0 unless the team allows self-approval.",
+    "described_pr_share": "Higher is better: reviewers and future readers know why the change exists.",
+    "tests_included_share": "Higher is better: code changes come with tests. Below ~50% is worth a look.",
+    "commits_per_pr_median": "Context only. 1-5 is typical; very high can mean rework or long-lived branches.",
+    "reviews_given": "Higher means more help to teammates. Compare with 'Comments per review' for depth.",
+    "prs_reviewed": "Higher is better: carrying a share of the team's review load.",
+    "approvals": "Context only. Teams that self-approve or need no approval make this meaningless.",
+    "changes_requested": "Context only. Some change requests show careful review; none at all can mean rubber-stamping.",
+    "review_comments": "Higher usually means deeper reviews. AI-generated comments can inflate it.",
+    "comments_per_review": "Higher means more thorough reviews. Near 0 with many reviews suggests quick approvals.",
+    "silent_approval_share": "Lower is better. Near 100% means approving without ever commenting.",
+    "review_turnaround_median_h": "Lower is better: teammates are unblocked sooner. Under a day is good.",
+    "lines_reviewed": "Higher means more code read for others. Volume only, not depth.",
+    "review_ratio": "Around 1 or above is healthy: they review at least as much as they ship. Far below 1 means others carry their reviews.",
+    "authors_helped": "Higher means helping more people, not only one close teammate.",
+    "repos_reviewed": "Higher means wider knowledge of the codebase.",
+    "prs_commented": "Higher means more engagement in others' work.",
+    "reviewers_received": "Context only. Very low can mean one person reviews everything (a bottleneck).",
+    "issues_opened": "Context only. Most teams track work in JIRA, so 0 is normal.",
+    "total_activity": "Higher means more visible GitHub activity. Says nothing about value.",
+    "active_days": "Higher means steady activity. Low can mean leave, meetings, design or on-call work.",
+    "active_weeks": "Higher is steadier. Gaps are normal for holidays and non-coding work.",
+    "longest_streak_days": "Context only. Long streaks without weekends can mean overwork.",
+    "weekend_share": "Context only. Persistently high can mean too much load; a few % is normal.",
+}
+for _m in METRIC_DEFS:
+    _m["read"] = METRIC_READ.get(_m["key"], "")
 
 # --------------------------------------------------------------------------- #
 # per-person collection
@@ -917,6 +968,9 @@ def person_metrics(person: dict) -> dict[str, Any]:
 
     given = person["reviews"]
     approvals = [r for r in given if r["state"] == "APPROVED"]
+    # GitHub records "comment, then approve" as two reviews: what counts is whether
+    # the person wrote anything on the PR, in any of their reviews.
+    talked_on = {r["pr_url"] for r in given if r["comments"] or r["body_chars"]}
     first_by_pr: dict[str, dict] = {}
     for r in sorted(given, key=lambda r: r["submittedAt"]):
         first_by_pr.setdefault(r["pr_url"], r)
@@ -956,8 +1010,7 @@ def person_metrics(person: dict) -> dict[str, Any]:
         "changes_requested": sum(1 for r in given if r["state"] == "CHANGES_REQUESTED"),
         "review_comments": sum(r["comments"] for r in given),
         "comments_per_review": ratio(sum(r["comments"] for r in given), len(given), 2),
-        "silent_approval_share": ratio(sum(1 for r in approvals if not r["comments"] and not r["body_chars"]),
-                                       len(approvals)),
+        "silent_approval_share": ratio(sum(1 for r in approvals if r["pr_url"] not in talked_on), len(approvals)),
         "review_turnaround_median_h": median(hours(r["pr_createdAt"], r["submittedAt"])
                                              for r in first_by_pr.values()),
         "lines_reviewed": sum(r["pr_size"] for r in first_by_pr.values()),
@@ -1078,11 +1131,14 @@ def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
             key = f"{(p['repository'] or '').split('/')[-1]}/" + "/".join(parts[:2] if len(parts) > 2 else parts[:1])
             dirs[key] += pr_classify.file_weight(f["path"], f["additions"], f["deletions"])
             dir_prs[key].add(p["url"])
-    exts = Counter()
+    exts: Counter = Counter()
+    ext_areas: dict[str, Counter] = defaultdict(Counter)
     for p in prs:
         for f in p.get("files") or []:
             name = f["path"].rsplit("/", 1)[-1]
-            exts[("." + name.rsplit(".", 1)[-1].lower()) if "." in name else name] += 1
+            ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else name
+            exts[ext] += 1
+            ext_areas[ext][pr_classify.file_area(f["path"], p["repository"])] += 1
 
     reviewed: dict[str, dict] = {}
     for r in person["reviews"]:
@@ -1100,7 +1156,8 @@ def work_mix(person: dict, months: list[str]) -> dict[str, Any]:
         "type_monthly": [{"month": m, **dict(c)} for m, c in type_monthly.items()],
         "type_by_area": [{"type": t, "area": a, "prs": n} for (t, a), n in cross.most_common()],
         "top_dirs": [{"dir": d, "lines": w, "prs": len(dir_prs[d])} for d, w in dirs.most_common(15)],
-        "file_types": [{"ext": e, "files": n} for e, n in exts.most_common(15)],
+        "file_types": [{"ext": e, "files": n, "areas": dict(ext_areas[e].most_common())}
+                       for e, n in exts.most_common(15)],
         "review_areas": [{"area": a, "prs": n, "lines": review_lines[a]} for a, n in review_areas.most_common()],
         "review_types": [{"type": t, "prs": n} for t, n in review_types.most_common()],
         "partial_prs": sum(1 for p in prs if p.get("files_partial")),
