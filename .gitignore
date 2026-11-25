@@ -34,3 +34,6 @@ desktop.ini
 out/
 reports/
 /.claude/settings.json
+
+# github-performance baseline cache
+.cache/

@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub performance report</title>
+<!--
+  Template for github_performance.py. It is copied next to the JSON it renders:
+    data/manifest.json      - what the run contains
+    data/summary.json       - metric definitions, every person's metrics, ranks and scores
+    data/org_baseline.json  - anonymous org-wide distributions (optional)
+    data/users/<login>.json - raw per-person data: PRs, reviews, commits, calendar, chart series
+  Browsers block fetch() from file://, so open it through the script's local server
+  (python github_performance.py --view <report folder>).
+-->
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface-0: #f6f7f9;
+  --surface-1: #ffffff;
+  --surface-2: #f0f1f3;
+  --border: #e3e5e8;
+  --grid: #ececec;
+  --text-primary: #191919;
+  --text-secondary: #666666;
+  --series-1: #257de0;
+  --accent-soft: #e8f1fc;
+  --div-pos: #257de0;
+  --div-neg: #ec4647;
+  --seq-0: #ebedf0; --seq-1: #b6d5f8; --seq-2: #6aabf1; --seq-3: #257de0; --seq-4: #0f4a96;
+  --band: #cce3fd;
+  --warn-bg: #fff4e0; --warn-text: #7a4a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-0: #111111; --surface-1: #191919; --surface-2: #242424;
+    --border: #333333; --grid: #2c2c2c;
+    --text-primary: #efefef; --text-secondary: #9c9c9c;
+    --series-1: #338ced; --accent-soft: #1a2a3d;
+    --div-pos: #338ced; --div-neg: #eb6263;
+    --seq-0: #2a2a2a; --seq-1: #0e3d7e; --seq-2: #1b64be; --seq-3: #338ced; --seq-4: #9dc8f7;
+    --band: #1d3b63;
+    --warn-bg: #3a2c10; --warn-text: #f5c97a;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-0: #111111; --surface-1: #191919; --surface-2: #242424;
+  --border: #333333; --grid: #2c2c2c;
+  --text-primary: #efefef; --text-secondary: #9c9c9c;
+  --series-1: #338ced; --accent-soft: #1a2a3d;
+  --div-pos: #338ced; --div-neg: #eb6263;
+  --seq-0: #2a2a2a; --seq-1: #0e3d7e; --seq-2: #1b64be; --seq-3: #338ced; --seq-4: #9dc8f7;
+  --band: #1d3b63;
+  --warn-bg: #3a2c10; --warn-text: #f5c97a;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body.viz-root {
+  background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--series-1); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header.top {
+  position: sticky; top: 0; z-index: 5; background: var(--surface-1);
+  border-bottom: 1px solid var(--border); padding: 12px 24px;
+  display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+}
+header.top h1 { font-size: 18px; margin: 0; font-weight: 600; }
+header.top .meta { color: var(--text-secondary); font-size: 13px; }
+header.top .spacer { flex: 1; }
+select, button {
+  font: inherit; color: var(--text-primary); background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer;
+}
+main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 60px; }
+section.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 20px; margin-bottom: 18px;
+}
+section.card > h2 { font-size: 16px; margin: 0 0 4px; font-weight: 600; }
+.sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 14px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 18px; }
+.grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.banner { background: var(--warn-bg); color: var(--warn-text); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; }
+.banner ul { margin: 4px 0 0 18px; padding: 0; }
+
+/* person header */
+.person { display: flex; gap: 14px; align-items: center; margin-bottom: 14px; }
+.person img { width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--border); }
+.person .name { font-size: 20px; font-weight: 600; }
+.person .login { color: var(--text-secondary); }
+.chip { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px;
+        background: var(--surface-2); color: var(--text-secondary); margin-left: 6px; vertical-align: middle; }
+
+/* stat tiles */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.tile { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; background: var(--surface-1); }
+.tile .label { color: var(--text-secondary); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 600; margin: 2px 0; font-variant-numeric: tabular-nums; }
+.tile .rank { font-size: 12px; color: var(--text-secondary); }
+.score-tiles .tile .value { font-size: 22px; }
+.meter { height: 6px; border-radius: 3px; background: var(--surface-2); margin-top: 6px; overflow: hidden; }
+.meter > span { display: block; height: 100%; border-radius: 3px; background: var(--series-1); }
+
+/* tables */
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { padding: 6px 8px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+th:first-child, td:first-child, td.l, th.l { text-align: left; }
+th { font-weight: 600; font-size: 12px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+th.sorted::after { content: " \2193"; }
+th.sorted.asc::after { content: " \2191"; }
+tbody tr:hover { background: var(--surface-2); }
+tr.selected { background: var(--accent-soft) !important; }
+td.wrap { white-space: normal; text-align: left; max-width: 420px; }
+.scroll { overflow: auto; max-height: 520px; }
+td.score { font-weight: 600; }
+.muted { color: var(--text-secondary); }
+.group-row td { background: var(--surface-2); font-weight: 600; text-align: left; }
+
+/* charts */
+.chart-title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+svg text { fill: var(--text-secondary); font-size: 11px; }
+svg .axis { stroke: var(--border); stroke-width: 1; }
+svg .gridline { stroke: var(--grid); stroke-width: 1; }
+.hbar { display: grid; grid-template-columns: minmax(120px, 38%) 1fr 64px; gap: 8px; align-items: center; margin: 3px 0; font-size: 13px; }
+.hbar .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hbar .track { height: 10px; }
+.hbar .fill { height: 10px; border-radius: 0 4px 4px 0; background: var(--series-1); min-width: 2px; }
+.hbar .num { text-align: right; font-variant-numeric: tabular-nums; }
+.strip-row { display: grid; grid-template-columns: 200px 1fr 120px; gap: 12px; align-items: center; padding: 6px 0;
+             border-bottom: 1px solid var(--grid); }
+.strip-row .v { text-align: right; font-variant-numeric: tabular-nums; }
+.legend { display: flex; gap: 14px; align-items: center; font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; margin-top: 6px; }
+.legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 4px; }
+#tip { position: fixed; pointer-events: none; z-index: 50; background: var(--surface-1); color: var(--text-primary);
+       border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12px;
+       box-shadow: 0 4px 14px rgba(0,0,0,.15); max-width: 320px; display: none; white-space: pre-line; }
+.empty { color: var(--text-secondary); font-style: italic; padding: 12px 0; }
+.toggle { display: inline-flex; gap: 0; }
+.toggle button { border-radius: 0; }
+.toggle button:first-child { border-radius: 6px 0 0 6px; }
+.toggle button:last-child { border-radius: 0 6px 6px 0; }
+.toggle button.on { background: var(--accent-soft); border-color: var(--series-1); }
+input[type=search] { font: inherit; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px;
+                     background: var(--surface-1); color: var(--text-primary); }
+</style>
+</head>
+<body class="viz-root">
+<header class="top">
+  <h1>GitHub performance</h1>
+  <span class="meta" id="meta">loading...</span>
+  <span class="spacer"></span>
+  <label>Person <select id="person-select"></select></label>
+  <button id="theme-btn" title="Switch light / dark">Theme</button>
+</header>
+<main id="app"><p class="empty">Loading report data...</p></main>
+<div id="tip" role="tooltip"></div>
+
+<script>
+"use strict";
+// ------------------------------------------------------------------ helpers
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const SVGNS = "http://www.w3.org/2000/svg";
+const state = { manifest: null, summary: null, baseline: null, users: {}, defs: {}, current: null, prSort: {key: "createdAt", asc: false} };
+
+function fmt(v, unit) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "–";
+  switch (unit) {
+    case "pct": return Math.round(v * 100) + "%";
+    case "hours": return v < 48 ? v.toFixed(1) + " h" : (v / 24).toFixed(1) + " d";
+    case "num": return (+v).toFixed(2).replace(/\.?0+$/, "") || "0";
+    default: return Math.round(v).toLocaleString();
+  }
+}
+const fmtPct = p => p === null || p === undefined ? "–" : "P" + Math.round(p);
+const date10 = s => s ? s.slice(0, 10) : "";
+const hoursBetween = (a, b) => a && b ? Math.max((new Date(b) - new Date(a)) / 3.6e6, 0) : null;
+
+// diverging cell tint for a 0..100 "good end = 100" score; the number is always printed too
+function scoreStyle(score) {
+  if (score === null || score === undefined) return "";
+  const d = (score - 50) / 50;                       // -1 .. 1
+  const color = d >= 0 ? "var(--div-pos)" : "var(--div-neg)";
+  const pct = Math.round(Math.abs(d) * 38);
+  return `background: color-mix(in srgb, ${color} ${pct}%, transparent)`;
+}
+
+// one tooltip for the whole page: any element with data-tip shows it
+const tip = $("#tip");
+document.addEventListener("mousemove", e => {
+  const el = e.target.closest("[data-tip]");
+  if (!el) { tip.style.display = "none"; return; }
+  tip.textContent = el.getAttribute("data-tip");
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + w > innerWidth - 8) x = e.clientX - w - 14;
+  if (y + h > innerHeight - 8) y = e.clientY - h - 14;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+});
+
+function svg(tag, attrs = {}, parent) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+// bar with 4px rounded data-end, square on the baseline
+function topRoundedBar(x, y, w, h, r = 4) {
+  if (h <= 0) return "";
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+// ------------------------------------------------------------------ charts
+function barChart(el, rows, { key, label, title, unit = "count", height = 150 }) {
+  el.innerHTML = `<div class="chart-title">${esc(title)}</div>`;
+  const W = Math.max(el.clientWidth || 300, 260), H = height, m = { t: 8, r: 6, b: 22, l: 34 };
+  const s = svg("svg", { width: W, height: H, role: "img", "aria-label": title }, el);
+  const max = niceMax(Math.max(...rows.map(r => r[key]), 0));
+  const iw = W - m.l - m.r, ih = H - m.t - m.b, step = iw / rows.length, bw = Math.max(step - 2, 1);
+  for (const t of [0, 0.5, 1]) {
+    const y = m.t + ih - t * ih;
+    svg("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, class: t === 0 ? "axis" : "gridline" }, s);
+    svg("text", { x: m.l - 6, y: y + 4, "text-anchor": "end" }, s).textContent = fmt(max * t, unit);
+  }
+  const labelEvery = Math.ceil(rows.length / Math.max(Math.floor(iw / 34), 1));
+  rows.forEach((r, i) => {
+    const x = m.l + i * step + 1, h = (r[key] / max) * ih;
+    const g = svg("g", { "data-tip": `${label(r)}\n${title}: ${fmt(r[key], unit)}` }, s);
+    svg("rect", { x: m.l + i * step, y: m.t, width: step, height: ih, fill: "transparent" }, g);  // hit target
+    if (h > 0) svg("path", { d: topRoundedBar(x, m.t + ih - h, bw, h), fill: "var(--series-1)" }, g);
+    if (i % labelEvery === 0)
+      svg("text", { x: x + bw / 2, y: H - 6, "text-anchor": "middle" }, s).textContent = label(r, true);
+  });
+}
+
+function hbars(el, rows, { label, value, unit = "count", tipFn, max }) {
+  if (!rows.length) { el.innerHTML = `<p class="empty">Nothing in this window.</p>`; return; }
+  max = max || Math.max(...rows.map(value), 1);
+  el.innerHTML = rows.map(r => `
+    <div class="hbar" data-tip="${esc(tipFn ? tipFn(r) : label(r) + ": " + fmt(value(r), unit))}">
+      <span class="lbl">${esc(label(r))}</span>
+      <span class="track"><span class="fill" style="display:block;width:${(100 * value(r) / max).toFixed(1)}%"></span></span>
+      <span class="num">${fmt(value(r), unit)}</span>
+    </div>`).join("");
+}
+
+function calendar(el, days) {
+  const cell = 12, gap = 2, step = cell + gap, top = 16, left = 28;
+  const first = new Date(days[0].date + "T00:00:00Z");
+  const offset = first.getUTCDay();
+  const weeks = Math.ceil((days.length + offset) / 7);
+  const W = left + weeks * step + 4, H = top + 7 * step + 4;
+  el.innerHTML = "";
+  const s = svg("svg", { width: W, height: H, role: "img", "aria-label": "Daily activity calendar" }, el);
+  const max = Math.max(...days.map(d => d.count), 1);
+  const thresholds = [0, Math.max(1, max * 0.15), max * 0.35, max * 0.65];
+  const level = c => c === 0 ? 0 : c <= thresholds[1] ? 1 : c <= thresholds[2] ? 2 : c <= thresholds[3] ? 3 : 4;
+  ["Mon", "Wed", "Fri"].forEach((d, i) =>
+    svg("text", { x: 0, y: top + (1 + 2 * i) * step + cell - 2 }, s).textContent = d);
+  let lastMonth = -1;
+  days.forEach((d, i) => {
+    const idx = i + offset, wk = Math.floor(idx / 7), dow = idx % 7;
+    const dt = new Date(d.date + "T00:00:00Z");
+    if (dow === 0 && dt.getUTCMonth() !== lastMonth && dt.getUTCDate() <= 7) {
+      lastMonth = dt.getUTCMonth();
+      svg("text", { x: left + wk * step, y: 11 }, s).textContent = MONTHS[lastMonth];
+    }
+    svg("rect", {
+      x: left + wk * step, y: top + dow * step, width: cell, height: cell, rx: 2,
+      fill: `var(--seq-${level(d.count)})`,
+      "data-tip": `${d.date}\n${d.count} activities: ${d.commits} commits, ${d.prs} PRs opened, ${d.reviews} reviews`,
+    }, s);
+  });
+  const lg = document.createElement("div");
+  lg.className = "legend";
+  lg.innerHTML = "Less " + [0, 1, 2, 3, 4].map(l => `<span class="sw" style="background:var(--seq-${l})"></span>`).join("") + " More";
+  el.appendChild(lg);
+}
+
+// person's value against the org distribution: IQR band, median tick, p90 tick, person dot
+function orgStrip(el, metrics, person) {
+  const rows = metrics.filter(d => state.baseline?.metrics?.[d.key]);
+  if (!rows.length) { el.innerHTML = `<p class="empty">No organisation baseline in this report (run without --no-baseline).</p>`; return; }
+  el.innerHTML = "";
+  for (const d of rows) {
+    const b = state.baseline.metrics[d.key], r = person.ranks[d.key] || {};
+    const value = r.org_value ?? person.metrics[d.key];
+    const vals = b.values, p95 = vals[Math.floor((vals.length - 1) * 0.95)];
+    const max = Math.max(p95, value ?? 0, b.p90, 1) * 1.05;
+    const pos = v => `${Math.min(100, 100 * v / max).toFixed(2)}%`;
+    const row = document.createElement("div");
+    row.className = "strip-row";
+    row.innerHTML = `
+      <div><div>${esc(d.label)}</div><div class="muted" style="font-size:12px">org median ${fmt(b.median, d.unit)}</div></div>
+      <div style="position:relative;height:26px" data-tip="${esc(`${d.label}\n${person.login}: ${fmt(value, d.unit)} (${fmtPct(r.org_pct)} of ${state.baseline.active_members} active members)\norg p25 ${fmt(b.p25, d.unit)} · median ${fmt(b.median, d.unit)} · p75 ${fmt(b.p75, d.unit)} · p90 ${fmt(b.p90, d.unit)} · max ${fmt(b.max, d.unit)}`)}">
+        <div style="position:absolute;left:0;right:0;top:12px;height:2px;background:var(--grid)"></div>
+        <div style="position:absolute;left:${pos(b.p25)};width:calc(${pos(b.p75)} - ${pos(b.p25)});top:7px;height:12px;background:var(--band);border-radius:3px"></div>
+        <div style="position:absolute;left:${pos(b.median)};top:4px;width:2px;height:18px;background:var(--text-secondary)"></div>
+        <div style="position:absolute;left:${pos(b.p90)};top:8px;width:1px;height:10px;background:var(--text-secondary)"></div>
+        ${value === null || value === undefined ? "" :
+          `<div style="position:absolute;left:calc(${pos(value)} - 6px);top:7px;width:12px;height:12px;border-radius:50%;background:var(--series-1);box-shadow:0 0 0 2px var(--surface-1)"></div>`}
+      </div>
+      <div class="v"><b>${fmt(value, d.unit)}</b> <span class="muted">${fmtPct(r.org_pct)}</span></div>`;
+    el.appendChild(row);
+  }
+  const lg = document.createElement("div");
+  lg.className = "legend";
+  lg.innerHTML = `<span><span class="sw" style="background:var(--series-1);border-radius:50%"></span>${esc(person.login)}</span>
+    <span><span class="sw" style="background:var(--band)"></span>middle 50% of the org (p25-p75)</span>
+    <span><span class="sw" style="background:var(--text-secondary);width:2px"></span>median</span>
+    <span class="muted">thin tick = p90 · P = percentile among ${state.baseline.active_members} active members</span>`;
+  el.appendChild(lg);
+}
+
+// ------------------------------------------------------------------ sections
+function renderProblems() {
+  const p = state.manifest.problems || [];
+  return p.length ? `<div class="banner"><b>${p.length} problem(s) while collecting - some numbers may be incomplete:</b><ul>${p.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>` : "";
+}
+
+const OVERVIEW_COLS = ["prs_merged", "prs_reviewed", "review_comments", "commits", "cycle_time_median_h", "review_turnaround_median_h", "active_days"];
+
+function renderOverview(el) {
+  const s = state.summary, groups = [...new Set(s.metric_defs.map(d => d.group))];
+  const multi = s.people.length > 1;
+  el.innerHTML = `
+    <h2>Overview</h2>
+    <p class="sub">Group score = average percentile of that group's metrics, turned so 100 is always the good end and 50 is typical.
+      ${multi ? `Ranked within the ${s.people.length} people in this report.` : `Only one person in the report, so scores use the organisation ranks where they exist.`}
+      Click a row to open the person; click a header to sort.</p>
+    <div class="scroll"><table id="overview-table">
+      <thead><tr><th class="l" data-k="login">Person</th>
+        ${groups.map(g => `<th data-k="g:${esc(g)}">${esc(g)}</th>`).join("")}
+        ${OVERVIEW_COLS.map(k => `<th data-k="${k}" data-tip="${esc(state.defs[k].desc)}">${esc(state.defs[k].label)}</th>`).join("")}
+      </tr></thead><tbody></tbody></table></div>`;
+  let sortKey = "login", asc = true;
+  const val = (p, k) => k === "login" ? p.login.toLowerCase() : k.startsWith("g:") ? p.group_scores[k.slice(2)] : p.metrics[k];
+  const draw = () => {
+    const rows = [...s.people].sort((a, b) => {
+      const x = val(a, sortKey), y = val(b, sortKey);
+      if (x === y) return 0; if (x === null || x === undefined) return 1; if (y === null || y === undefined) return -1;
+      return (x < y ? -1 : 1) * (asc ? 1 : -1);
+    });
+    $("tbody", el).innerHTML = rows.map(p => `
+      <tr data-login="${esc(p.login)}" class="${p.login === state.current ? "selected" : ""}" style="cursor:pointer">
+        <td>${esc(p.name || p.login)} <span class="muted">${p.name ? esc(p.login) : ""}</span>${p.role === "peer" ? '<span class="chip">peer</span>' : ""}</td>
+        ${groups.map(g => { const v = p.group_scores[g]; return `<td class="score" style="${scoreStyle(v)}">${v === undefined ? "–" : Math.round(v)}</td>`; }).join("")}
+        ${OVERVIEW_COLS.map(k => `<td>${fmt(p.metrics[k], state.defs[k].unit)}</td>`).join("")}
+      </tr>`).join("");
+    el.querySelectorAll("th").forEach(th => th.classList.toggle("sorted", th.dataset.k === sortKey));
+    el.querySelectorAll("th.sorted").forEach(th => th.classList.toggle("asc", asc));
+  };
+  el.querySelectorAll("th").forEach(th => th.addEventListener("click", () => {
+    if (sortKey === th.dataset.k) asc = !asc; else { sortKey = th.dataset.k; asc = th.dataset.k === "login"; }
+    draw();
+  }));
+  el.addEventListener("click", e => { const tr = e.target.closest("tr[data-login]"); if (tr) selectPerson(tr.dataset.login); });
+  draw();
+}
+
+const TILES = ["prs_merged", "reviews_given", "commits", "review_comments", "cycle_time_median_h", "review_turnaround_median_h", "active_days", "repos_contributed"];
+
+function rankText(r) {
+  const parts = [];
+  if (r.org_pct !== undefined && r.org_pct !== null) parts.push(`org ${fmtPct(r.org_pct)}`);
+  if (r.cohort_pct !== undefined && r.cohort_pct !== null) parts.push(`cohort ${fmtPct(r.cohort_pct)}`);
+  return parts.join(" · ") || "&nbsp;";
+}
+
+// someone whose first activity is well into the window is compared with people who had the whole year
+function tenureNote(u) {
+  const first = u.series.first_activity, from = state.manifest.from;
+  if (!first) return `<div class="banner">No GitHub activity in this window.</div>`;
+  const late = (new Date(first) - new Date(from)) / 864e5;
+  return late > 60 ? `<div class="banner">First activity in the window is <b>${first}</b>, ${Math.round(late)} days after it starts
+    (new joiner, role change or a new account?). Totals are compared with people active for the whole period, so read the
+    org and cohort percentiles with that in mind, or re-run with <code>--days</code> covering only the active span.</div>`
+    : `<p class="sub">Active from ${first} to ${u.series.last_activity}.</p>`;
+}
+
+function renderPerson(el, login) {
+  const p = state.summary.people.find(x => x.login === login);
+  const u = state.users[login];
+  const prof = u.profile, defs = state.summary.metric_defs;
+  const groups = Object.entries(p.group_scores);
+  el.innerHTML = `
+    <div class="person">
+      ${prof.avatarUrl ? `<img src="${esc(prof.avatarUrl)}" alt="">` : ""}
+      <div><div class="name">${esc(prof.name || prof.login)}${p.role === "peer" ? '<span class="chip">peer</span>' : ""}</div>
+        <div class="login"><a href="${esc(prof.url)}" target="_blank" rel="noopener">${esc(prof.login)}</a>${prof.company ? " · " + esc(prof.company) : ""}</div></div>
+    </div>
+    ${tenureNote(u)}
+    <div class="tiles score-tiles" style="margin-bottom:12px">
+      ${groups.map(([g, v]) => `<div class="tile" data-tip="${esc(g)} score: average percentile of the group's ranked metrics (100 = best end, 50 = typical)">
+        <div class="label">${esc(g)}</div><div class="value">${Math.round(v)}<span class="muted" style="font-size:13px"> / 100</span></div>
+        <div class="meter"><span style="width:${v}%"></span></div></div>`).join("")}
+    </div>
+    <div class="tiles">
+      ${TILES.map(k => { const d = state.defs[k], r = p.ranks[k] || {};
+        return `<div class="tile" data-tip="${esc(d.desc)}"><div class="label">${esc(d.label)}</div>
+          <div class="value">${fmt(p.metrics[k], d.unit)}</div><div class="rank">${rankText(r)}</div></div>`; }).join("")}
+    </div>`;
+}
+
+function renderCompany(el, login) {
+  const p = state.summary.people.find(x => x.login === login);
+  const b = state.baseline;
+  el.innerHTML = `<h2>Compared with the company</h2>
+    <p class="sub">${b ? `Every member of <b>${esc(state.summary.org.login)}</b> with any PR activity in the window (${b.active_members} of ${b.members}${b.sampled ? ", sampled" : ""}), counted with the same GitHub searches.` : ""}
+      Org counts come from search, so they can differ slightly from the detailed numbers below.</p><div id="strips"></div>`;
+  orgStrip($("#strips", el), state.summary.metric_defs.filter(d => d.org), p);
+}
+
+function renderActivity(el, login) {
+  const u = state.users[login], monthly = u.series.monthly;
+  const lbl = (r, short) => { const [y, m] = r.month.split("-"); return short ? MONTHS[m - 1] : `${MONTHS[m - 1]} ${y}`; };
+  el.innerHTML = `<h2>Activity over time</h2><p class="sub">Per month. Small multiples, one measure each, so every chart has its own honest scale.</p>
+    <div class="grid4"><div id="m1"></div><div id="m2"></div><div id="m3"></div><div id="m4"></div></div>
+    <h3 class="chart-title" style="margin-top:18px">Daily activity</h3><div id="cal" style="overflow-x:auto"></div>`;
+  barChart($("#m1", el), monthly, { key: "prs_opened", title: "PRs opened", label: lbl });
+  barChart($("#m2", el), monthly, { key: "prs_merged", title: "PRs merged", label: lbl });
+  barChart($("#m3", el), monthly, { key: "reviews_given", title: "Reviews given", label: lbl });
+  barChart($("#m4", el), monthly, { key: "commits", title: "Commits (default branches)", label: lbl });
+  calendar($("#cal", el), u.calendar);
+}
+
+function renderWork(el, login) {
+  const u = state.users[login];
+  el.innerHTML = `<h2>Where the work goes</h2><p class="sub">Repositories, PR sizes and review outcomes.</p>
+    <div class="grid2">
+      <div><div class="chart-title">Repositories (commits + PRs + reviews)</div><div id="repos"></div></div>
+      <div><div class="chart-title">Merged PR size (lines added + deleted)</div><div id="sizes"></div>
+           <div class="chart-title" style="margin-top:16px">Reviews given, by outcome</div><div id="states"></div></div>
+      <div><div class="chart-title">Whose PRs they review</div><div id="authors"></div></div>
+      <div><div class="chart-title">Who reviews their PRs</div><div id="reviewers"></div></div>
+    </div>`;
+  const repos = u.series.repos.slice(0, 12);
+  hbars($("#repos", el), repos, { label: r => r.repo.split("/").pop(), value: r => r.prs + r.reviews + r.commits,
+    tipFn: r => `${r.repo}\n${r.commits} commits · ${r.prs} PRs opened · ${r.reviews} reviews` });
+  hbars($("#sizes", el), u.series.pr_sizes, { label: r => r.bucket, value: r => r.prs });
+  const stateName = { APPROVED: "Approved", CHANGES_REQUESTED: "Changes requested", COMMENTED: "Commented", DISMISSED: "Dismissed" };
+  hbars($("#states", el), u.series.review_states, { label: r => stateName[r.state] || r.state, value: r => r.count });
+  hbars($("#authors", el), u.series.top_authors_reviewed.slice(0, 10), { label: r => r.login, value: r => r.reviews });
+  hbars($("#reviewers", el), u.series.top_reviewers.slice(0, 10), { label: r => r.login, value: r => r.reviews });
+}
+
+function renderMetrics(el, login) {
+  const p = state.summary.people.find(x => x.login === login), s = state.summary;
+  const multi = s.people.length > 1;
+  const groups = [...new Set(s.metric_defs.map(d => d.group))];
+  const better = { up: "↑ higher is better", down: "↓ lower is better" };
+  el.innerHTML = `<h2>All metrics</h2>
+    <p class="sub">Hover a metric for its definition. "Score" is the percentile turned so that 100 is the good end; context-only metrics have no score.</p>
+    <div class="scroll" style="max-height:none"><table>
+      <thead><tr><th class="l">Metric</th><th>Value</th>
+        ${multi ? "<th>Cohort median</th><th>Cohort pct</th>" : ""}
+        ${state.baseline ? "<th>Org median</th><th>Org pct</th>" : ""}<th>Score</th><th class="l">Direction</th></tr></thead>
+      <tbody>${groups.map(g => `<tr class="group-row"><td colspan="8">${esc(g)}</td></tr>` +
+        s.metric_defs.filter(d => d.group === g).map(d => {
+          const r = p.ranks[d.key] || {}, b = state.baseline?.metrics?.[d.key];
+          const score = r.cohort_score ?? r.org_score;
+          return `<tr><td class="l" data-tip="${esc(d.desc)}">${esc(d.label)}</td><td><b>${fmt(p.metrics[d.key], d.unit)}</b></td>
+            ${multi ? `<td>${fmt(s.cohort[d.key]?.median, d.unit)}</td><td>${fmtPct(r.cohort_pct)}</td>` : ""}
+            ${state.baseline ? `<td>${b ? fmt(b.median, d.unit) : "–"}</td><td>${fmtPct(r.org_pct)}</td>` : ""}
+            <td class="score" style="${scoreStyle(score)}">${score === undefined || score === null ? "–" : Math.round(score)}</td>
+            <td class="l muted">${better[d.better] || "context only"}</td></tr>`;
+        }).join("")).join("")}</tbody></table></div>`;
+}
+
+const PR_COLS = [
+  { k: "repository", t: "Repo", l: true, v: p => (p.repository || "").split("/").pop() },
+  { k: "title", t: "Title", l: true, v: p => p.title },
+  { k: "state", t: "State", l: true, v: p => p.state },
+  { k: "createdAt", t: "Opened", v: p => p.createdAt, f: date10 },
+  { k: "size", t: "Lines", v: p => p.additions + p.deletions, f: v => fmt(v) },
+  { k: "changedFiles", t: "Files", v: p => p.changedFiles, f: v => fmt(v) },
+  { k: "commits", t: "Commits", v: p => p.commits, f: v => fmt(v) },
+  { k: "cycle", t: "Open → merged", v: p => hoursBetween(p.createdAt, p.mergedAt), f: v => fmt(v, "hours") },
+  { k: "reviews", t: "Human reviews", v: p => p.reviews.filter(r => !r.bot && r.author !== p.author).length, f: v => fmt(v) },
+  { k: "mergedBy", t: "Merged by", l: true, v: p => p.mergedBy || "" },
+];
+
+function renderPRs(el, login) {
+  const u = state.users[login];
+  el.innerHTML = `<h2>Pull requests opened <span class="muted" style="font-weight:400">(${u.pull_requests.length})</span></h2>
+    <p class="sub"><input type="search" id="pr-filter" placeholder="Filter by repo, title, state..."></p>
+    <div class="scroll"><table><thead><tr>${PR_COLS.map(c => `<th class="${c.l ? "l" : ""}" data-k="${c.k}">${c.t}</th>`).join("")}</tr></thead><tbody></tbody></table></div>
+    <h2 style="margin-top:22px">Reviews given <span class="muted" style="font-weight:400">(${u.reviews.length})</span></h2>
+    <div class="scroll"><table><thead><tr><th class="l">Submitted</th><th class="l">Repo</th><th class="l">PR</th><th class="l">Author</th><th class="l">Outcome</th><th>Inline comments</th><th>PR lines</th><th>Hours after PR opened</th></tr></thead>
+    <tbody>${[...u.reviews].sort((a, b) => b.submittedAt.localeCompare(a.submittedAt)).map(r => `<tr>
+      <td class="l">${date10(r.submittedAt)}</td><td class="l">${esc((r.repository || "").split("/").pop())}</td>
+      <td class="wrap"><a href="${esc(r.pr_url)}" target="_blank" rel="noopener">#${r.pr_number}</a> ${esc(r.pr_title)}</td>
+      <td class="l">${esc(r.pr_author)}</td><td class="l">${esc(r.state)}</td><td>${r.comments}</td><td>${fmt(r.pr_size)}</td>
+      <td>${fmt(hoursBetween(r.pr_createdAt, r.submittedAt), "hours")}</td></tr>`).join("") || `<tr><td colspan="8" class="empty">No reviews in this window.</td></tr>`}</tbody></table></div>`;
+  const body = $("tbody", el);
+  const draw = () => {
+    const q = ($("#pr-filter", el).value || "").toLowerCase();
+    const col = PR_COLS.find(c => c.k === state.prSort.key);
+    const rows = u.pull_requests.filter(p => !q || `${p.repository} ${p.title} ${p.state}`.toLowerCase().includes(q))
+      .sort((a, b) => { const x = col.v(a), y = col.v(b);
+        if (x === y) return 0; if (x === null) return 1; if (y === null) return -1;
+        return (x < y ? -1 : 1) * (state.prSort.asc ? 1 : -1); });
+    body.innerHTML = rows.map(p => `<tr>${PR_COLS.map(c => {
+      const v = c.v(p);
+      if (c.k === "title") return `<td class="wrap"><a href="${esc(p.url)}" target="_blank" rel="noopener">#${p.number}</a> ${esc(v)}${p.isDraft ? ' <span class="chip">draft</span>' : ""}</td>`;
+      return `<td class="${c.l ? "l" : ""}">${esc(c.f ? c.f(v) : v)}</td>`; }).join("")}</tr>`).join("")
+      || `<tr><td colspan="${PR_COLS.length}" class="empty">No pull requests.</td></tr>`;
+    el.querySelectorAll("thead th[data-k]").forEach(th => { th.classList.toggle("sorted", th.dataset.k === state.prSort.key); th.classList.toggle("asc", state.prSort.asc); });
+  };
+  el.querySelectorAll("thead th[data-k]").forEach(th => th.addEventListener("click", () => {
+    state.prSort = { key: th.dataset.k, asc: state.prSort.key === th.dataset.k ? !state.prSort.asc : false }; draw(); }));
+  $("#pr-filter", el).addEventListener("input", draw);
+  draw();
+}
+
+function renderGlossary(el) {
+  const s = state.summary, groups = [...new Set(s.metric_defs.map(d => d.group))];
+  el.innerHTML = `<h2>How to read this</h2>
+    <p class="sub">These numbers describe activity on GitHub, not the value of the work. Use them to start a conversation:
+      on-call, design, mentoring, meetings and JIRA work do not show up here, and volume metrics (lines, commits) are easy to inflate.
+      Compare people with similar roles and tenure.</p>
+    ${groups.map(g => `<h3 class="chart-title" style="margin-top:12px">${esc(g)}</h3><table><tbody>${
+      s.metric_defs.filter(d => d.group === g).map(d => `<tr><td class="l" style="width:260px"><b>${esc(d.label)}</b></td><td class="wrap" style="max-width:none">${esc(d.desc)}</td></tr>`).join("")}</tbody></table>`).join("")}`;
+}
+
+// ------------------------------------------------------------------ wiring
+function selectPerson(login) {
+  state.current = login;
+  $("#person-select").value = login;
+  history.replaceState(null, "", "#" + encodeURIComponent(login));
+  document.querySelectorAll("#overview-table tr[data-login]").forEach(tr => tr.classList.toggle("selected", tr.dataset.login === login));
+  for (const [id, fn] of [["person-card", renderPerson], ["company-card", renderCompany], ["activity-card", renderActivity],
+                          ["work-card", renderWork], ["metrics-card", renderMetrics], ["prs-card", renderPRs]]) fn($("#" + id), login);
+}
+
+async function getJSON(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+  return r.json();
+}
+
+async function load() {
+  try {
+    state.manifest = await getJSON("data/manifest.json");
+    state.summary = await getJSON("data/" + state.manifest.summary);
+    if (state.manifest.org_baseline) state.baseline = await getJSON("data/" + state.manifest.org_baseline);
+    await Promise.all(state.manifest.people.map(async p => { state.users[p.login] = await getJSON("data/" + p.file); }));
+  } catch (err) {
+    $("#app").innerHTML = `<section class="card"><h2>Could not load the report data</h2>
+      <p>${esc(err.message)}</p><p class="sub">Browsers block reading JSON from <code>file://</code>. Serve this folder with
+      <code>python github_performance.py --view &lt;this folder&gt;</code> (or <code>python -m http.server</code> inside it).</p></section>`;
+    $("#meta").textContent = "";
+    return;
+  }
+  state.summary.metric_defs.forEach(d => state.defs[d.key] = d);
+  const m = state.manifest;
+  $("#meta").textContent = `${state.summary.org.name || m.org} · ${date10(m.from)} → ${date10(m.to)} (${m.days} days) · generated ${date10(m.generated_at)}`;
+  const sel = $("#person-select");
+  sel.innerHTML = m.people.map(p => `<option value="${esc(p.login)}">${esc(p.name || p.login)}${p.role === "peer" ? " (peer)" : ""}</option>`).join("");
+  sel.addEventListener("change", () => selectPerson(sel.value));
+
+  $("#app").innerHTML = `${renderProblems()}
+    <section class="card" id="overview-card"></section>
+    <section class="card" id="person-card"></section>
+    <section class="card" id="company-card"></section>
+    <section class="card" id="activity-card"></section>
+    <section class="card" id="work-card"></section>
+    <section class="card" id="metrics-card"></section>
+    <section class="card" id="prs-card"></section>
+    <section class="card" id="glossary-card"></section>`;
+  renderOverview($("#overview-card"));
+  renderGlossary($("#glossary-card"));
+  const fromHash = decodeURIComponent(location.hash.slice(1));
+  const first = m.people.find(p => p.login === fromHash) || m.people.find(p => p.role === "target") || m.people[0];
+  selectPerson(first.login);
+  let resizeTimer;
+  addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => renderActivity($("#activity-card"), state.current), 150); });
+}
+
+$("#theme-btn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  localStorage.setItem("gh-perf-theme", root.dataset.theme);
+});
+if (localStorage.getItem("gh-perf-theme")) document.documentElement.dataset.theme = localStorage.getItem("gh-perf-theme");
+load();
+</script>
+</body>
+</html>
