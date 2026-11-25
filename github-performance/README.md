@@ -56,6 +56,13 @@ Searches over 1000 results are split by date automatically.
   were already in the company by then, and cohort peers are re-measured over the same days
   from their raw data. Everyone else is compared with the members who were there for the
   whole window.
+* **Similar tenure**: a separate section compares the person with the org members whose
+  time in the company (from account creation) is 0.5x to 1.5x theirs, e.g. 1 to 3 months for
+  someone who joined 2 months ago (`TENURE_LOW` / `TENURE_HIGH`). Because a longer tenure
+  means more time to accumulate activity, everyone is measured **per 30 days of their own time
+  in the window**. Members there for the whole window reuse the org baseline counts; members
+  who joined inside it get their own search counts, cached for 7 days in
+  `.cache/member_counts_<org>.json`.
 * **Score** = the percentile turned so that 100 is always the good end (lower cycle time
   is better, more reviews is better). Group scores are the average over a group.
   Context-only metrics (lines added, weekend share, ...) are shown but never scored.

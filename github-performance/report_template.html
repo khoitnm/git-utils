@@ -295,23 +295,20 @@ const baselineFor = p => state.baselines[p.comparison?.org_file] || null;
 const joinedLate = p => p.comparison && p.comparison.from !== state.summary.from;
 const windowText = p => `${date10(p.comparison.from)} \u2192 ${date10(p.comparison.to)} (${p.comparison.days} days)`;
 
-// person's value against the org distribution: IQR band, median tick, p90 tick, person dot
-function orgStrip(el, metrics, person) {
-  const base = baselineFor(person);
-  const rows = metrics.filter(d => base?.metrics?.[d.key]);
-  if (!rows.length) { el.innerHTML = `<p class="empty">No organisation baseline in this report (run without --no-baseline).</p>`; return; }
+// person's value against a distribution: IQR band, median tick, p90 tick, person dot
+function distStrip(el, rows, { who, population, n, medianLabel = "median" }) {
+  if (!rows.length) { el.innerHTML = `<p class="empty">No comparison data.</p>`; return; }
   el.innerHTML = "";
   for (const d of rows) {
-    const b = base.metrics[d.key], r = person.ranks[d.key] || {};
-    const value = r.org_value ?? person.metrics[d.key];
-    const vals = b.values, p95 = vals[Math.floor((vals.length - 1) * 0.95)];
-    const max = Math.max(p95, value ?? 0, b.p90, 1) * 1.05;
-    const pos = v => `${Math.min(100, 100 * v / max).toFixed(2)}%`;
+    const b = d.stats, value = d.value, vals = b.values || [];
+    const p95 = vals.length ? vals[Math.floor((vals.length - 1) * 0.95)] : 0;
+    const max = Math.max(p95, value ?? 0, b.p90 ?? 0, 1) * 1.05;
+    const pos = v => `${Math.min(100, 100 * (v ?? 0) / max).toFixed(2)}%`;
     const row = document.createElement("div");
     row.className = "strip-row";
     row.innerHTML = `
-      <div><div>${esc(d.label)}</div><div class="muted" style="font-size:12px">org median ${fmt(b.median, d.unit)}</div></div>
-      <div style="position:relative;height:26px" data-tip="${esc(`${d.label}\n${person.login}: ${fmt(value, d.unit)} (${fmtPct(r.org_pct)} of ${base.active_members} active members)\norg p25 ${fmt(b.p25, d.unit)} · median ${fmt(b.median, d.unit)} · p75 ${fmt(b.p75, d.unit)} · p90 ${fmt(b.p90, d.unit)} · max ${fmt(b.max, d.unit)}`)}">
+      <div><div>${esc(d.label)}</div><div class="muted" style="font-size:12px">${medianLabel} ${fmt(b.median, d.unit)}</div></div>
+      <div style="position:relative;height:26px" data-tip="${esc(`${d.label}\n${who}: ${fmt(value, d.unit)} (${fmtPct(d.pct)} of ${n} ${population})\np25 ${fmt(b.p25, d.unit)} · median ${fmt(b.median, d.unit)} · p75 ${fmt(b.p75, d.unit)} · p90 ${fmt(b.p90, d.unit)} · max ${fmt(b.max, d.unit)}`)}">
         <div style="position:absolute;left:0;right:0;top:12px;height:2px;background:var(--grid)"></div>
         <div style="position:absolute;left:${pos(b.p25)};width:calc(${pos(b.p75)} - ${pos(b.p25)});top:7px;height:12px;background:var(--band);border-radius:3px"></div>
         <div style="position:absolute;left:${pos(b.median)};top:4px;width:2px;height:18px;background:var(--text-secondary)"></div>
@@ -319,16 +316,46 @@ function orgStrip(el, metrics, person) {
         ${value === null || value === undefined ? "" :
           `<div style="position:absolute;left:calc(${pos(value)} - 6px);top:7px;width:12px;height:12px;border-radius:50%;background:var(--series-1);box-shadow:0 0 0 2px var(--surface-1)"></div>`}
       </div>
-      <div class="v"><b>${fmt(value, d.unit)}</b> <span class="muted">${fmtPct(r.org_pct)}</span></div>`;
+      <div class="v"><b>${fmt(value, d.unit)}</b> <span class="muted">${fmtPct(d.pct)}</span></div>`;
     el.appendChild(row);
   }
   const lg = document.createElement("div");
   lg.className = "legend";
-  lg.innerHTML = `<span><span class="sw" style="background:var(--series-1);border-radius:50%"></span>${esc(person.login)}</span>
-    <span><span class="sw" style="background:var(--band)"></span>middle 50% of the org (p25-p75)</span>
+  lg.innerHTML = `<span><span class="sw" style="background:var(--series-1);border-radius:50%"></span>${esc(who)}</span>
+    <span><span class="sw" style="background:var(--band)"></span>middle 50% (p25-p75)</span>
     <span><span class="sw" style="background:var(--text-secondary);width:2px"></span>median</span>
-    <span class="muted">thin tick = p90 · P = percentile among ${base.active_members} active members</span>`;
+    <span class="muted">thin tick = p90 · P = percentile among ${n} ${population}</span>`;
   el.appendChild(lg);
+}
+
+function orgStrip(el, metrics, person) {
+  const base = baselineFor(person);
+  const rows = metrics.filter(d => base?.metrics?.[d.key]).map(d => {
+    const r = person.ranks[d.key] || {};
+    return { label: d.label, unit: d.unit, value: r.org_value ?? person.metrics[d.key], pct: r.org_pct, stats: base.metrics[d.key] };
+  });
+  if (!rows.length) { el.innerHTML = `<p class="empty">No organisation baseline in this report (run without --no-baseline).</p>`; return; }
+  distStrip(el, rows, { who: person.login, population: "active members", n: base.active_members, medianLabel: "org median" });
+}
+
+const tenureText = d => d < 60 ? `${d} days` : d < 730 ? `${(d / 30.4).toFixed(1)} months` : `${(d / 365).toFixed(1)} years`;
+
+function renderTenure(el, login) {
+  const p = state.summary.people.find(x => x.login === login), t = p.tenure;
+  if (!t) { el.innerHTML = `<h2>Compared with members of similar tenure</h2><p class="empty">Not available: needs the account creation date and the organisation baseline (run without --no-baseline).</p>`; return; }
+  const rateUnit = d => d.unit === "count" ? "num" : d.unit;
+  const rows = state.summary.metric_defs.filter(d => t.metrics[d.key]).map(d => {
+    const m = t.metrics[d.key];
+    return { label: d.key === "review_ratio" ? d.label : `${d.label} / ${t.rate_days} days`, unit: rateUnit(d), value: m.value, pct: m.pct, stats: m };
+  });
+  el.innerHTML = `<h2>Compared with members of similar tenure <span class="muted" style="font-weight:400">· in the company ${tenureText(t.tenure_days)}</span></h2>
+    <p class="sub">Members who have been in <b>${esc(state.summary.org.login)}</b> between ${tenureText(t.range_days[0])} and ${tenureText(t.range_days[1])}
+      (${t.low}× to ${t.high}× this person's ${tenureText(t.tenure_days)}): ${t.active_members} with PR activity, of ${t.members}.
+      Tenure counts from the GitHub account creation date. Everyone is measured <b>per ${t.rate_days} days of their own time in the window</b>
+      (this person: ${t.own_days} days), so someone who has been here longer does not win on totals alone.</p>
+    ${t.active_members < 5 ? `<div class="banner">Only ${t.active_members} comparable member(s): treat these percentiles as rough.</div>` : ""}
+    <div id="tenure-strips"></div>`;
+  distStrip($("#tenure-strips", el), rows, { who: p.login, population: "members of similar tenure", n: t.active_members, medianLabel: "peer median" });
 }
 
 // ------------------------------------------------------------------ sections
@@ -397,7 +424,7 @@ function tenureNote(p, u) {
     return `<div class="banner">Joined on <b>${date10(c.joined)}</b> (GitHub account created), so every comparison uses the same window:
       <b>${windowText(p)}</b>. The organisation baseline is counted over those days, for the
       ${base ? base.eligible_members : "?"} members who were already in the company (${base ? base.active_members : "?"} of them active)${
-      c.cohort.length > 1 ? `, and the ${c.cohort.length - 1} other people in this report are measured over the same days` : ""}.</div>`;
+      c.cohort.length > 1 ? `, and the ${c.cohort.length - 1} other ${c.cohort.length === 2 ? "person" : "people"} in this report ${c.cohort.length === 2 ? "is" : "are"} measured over the same days` : ""}.</div>`;
   }
   if (!first) return `<div class="banner">No GitHub activity in this window.</div>`;
   const late = (new Date(first) - new Date(state.manifest.from)) / 864e5;
@@ -656,7 +683,7 @@ function selectPerson(login) {
   $("#person-select").value = login;
   history.replaceState(null, "", "#" + encodeURIComponent(login));
   document.querySelectorAll("#overview-table tr[data-login]").forEach(tr => tr.classList.toggle("selected", tr.dataset.login === login));
-  for (const [id, fn] of [["person-card", renderPerson], ["company-card", renderCompany], ["activity-card", renderActivity],
+  for (const [id, fn] of [["person-card", renderPerson], ["company-card", renderCompany], ["tenure-card", renderTenure], ["activity-card", renderActivity],
                           ["work-card", renderWork], ["mix-card", renderMix], ["metrics-card", renderMetrics], ["prs-card", renderPRs]]) fn($("#" + id), login);
 }
 
@@ -690,6 +717,7 @@ async function load() {
     <section class="card" id="overview-card"></section>
     <section class="card" id="person-card"></section>
     <section class="card" id="company-card"></section>
+    <section class="card" id="tenure-card"></section>
     <section class="card" id="activity-card"></section>
     <section class="card" id="work-card"></section>
     <section class="card" id="mix-card"></section>

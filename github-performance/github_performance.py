@@ -99,6 +99,11 @@ BASELINE_CACHE_DAYS = 7
 # joiner: they are compared over [join date, end] only, with members who were
 # already in the org by then (enterprise accounts are created on joining).
 JOIN_GRACE_DAYS = 14
+# "Similar tenure" = members whose time in the company is within these factors of
+# the person's (2 months -> 1 to 3 months). They are compared per 30 days of
+# their own time in the window, so a longer tenure does not mean bigger totals.
+TENURE_LOW, TENURE_HIGH = 0.5, 1.5
+RATE_DAYS = 30
 SMALL_PR_LINES = 200        # "small PR" threshold, lines added + deleted
 DESCRIBED_PR_CHARS = 30     # a PR body shorter than this counts as "no description"
 
@@ -446,8 +451,14 @@ def search_commits(gh: GitHub, login: str, org: str, start: date, end: date) -> 
 
 def count_batch(gh: GitHub, logins: list[str], org: str, start: date, end: date) -> dict[str, dict]:
     """The COUNT_SEARCHES for several people in one aliased GraphQL request."""
+    return count_batch_ranges(gh, [(login, start, end) for login in logins], org)
+
+
+def count_batch_ranges(gh: GitHub, items: list[tuple[str, date, date]], org: str) -> dict[str, dict]:
+    """Like count_batch, but every login has its own date range."""
+    logins = [login for login, _, _ in items]
     parts = []
-    for i, login in enumerate(logins):
+    for i, (login, start, end) in enumerate(items):
         for key, template in COUNT_SEARCHES.items():
             q = f"org:{org} " + template.format(l=login, a=start.isoformat(), b=end.isoformat())
             parts.append(f'u{i}_{key}: search(query:{json.dumps(q)}, type:ISSUE, first:0) {{ issueCount }}')
@@ -1287,6 +1298,117 @@ def compare(people: dict[str, dict], windows: dict[datetime, dict], start: datet
         }
 
 
+def tenure_window(created: datetime | None, start: datetime, end: datetime) -> tuple[date, date, int]:
+    """A member's own part of the report window: from joining (or the window
+    start) to the end, and its length in days."""
+    first = max(created, start) if created else start
+    return first.date(), end.date(), max((end - first).days, 1)
+
+
+def as_rates(counts: dict, days: int) -> dict[str, float | None]:
+    rates = {k: round(counts[k] * RATE_DAYS / days, 2) for k in COUNT_SEARCHES}
+    rates["review_ratio"] = counts.get("review_ratio")  # already a ratio
+    return rates
+
+
+def tenure_compare(gh: GitHub, org: str, people: dict[str, dict], start: datetime, end: datetime,
+                   args: argparse.Namespace) -> None:
+    """For every person: the org members with a similar tenure (TENURE_LOW..HIGH x
+    theirs), everyone measured per RATE_DAYS over their own time in the window."""
+    label = f"{(end - start).days}d"
+    full = build_baseline(gh, org, start, end, label, args.baseline_sample, False, args.quiet)
+    joined, full_counts = full.get("joined") or {}, full.get("members") or {}
+    cache_path = CACHE_DIR / f"member_counts_{org}.json"
+    cache = {}
+    if cache_path.is_file() and not args.refresh_baseline:
+        cache = json.loads(cache_path.read_text(encoding="utf-8")).get("entries", {})
+
+    def fresh(login: str, first: date) -> dict | None:
+        entry = cache.get(login)
+        if entry and entry["from"] == first.isoformat() and \
+                datetime.now(timezone.utc) - ts(entry["fetched_at"]) < timedelta(days=BASELINE_CACHE_DAYS):
+            return entry
+        return None
+
+    plans: dict[str, dict] = {}
+    todo: dict[str, tuple[date, date]] = {}
+    for login, person in people.items():
+        created = ts(person["profile"].get("createdAt"))
+        if not created:
+            continue
+        tenure = (end - created).days
+        lo, hi = tenure * TENURE_LOW, tenure * TENURE_HIGH
+        peers = [m for m, j in joined.items()
+                 if j and lo <= (end - ts(j)).days <= hi and not same(m, login)]
+        plans[login] = {"tenure_days": tenure, "range_days": [round(lo), round(hi)], "peers": peers}
+        for m in peers + [login]:
+            first, last, _ = tenure_window(ts(joined.get(m)) if m != login else created, start, end)
+            if first == start.date() and m in full_counts:
+                continue  # in the company for the whole window: the baseline counts are exact
+            if not fresh(m, first):
+                todo[m] = (first, last)
+
+    if todo:
+        log(f"similar tenure: counting {len(todo)} member(s) over their own time in the window...",
+            quiet=args.quiet)
+        items = [(m, a, b) for m, (a, b) in todo.items()]
+        batches = [items[i:i + BASELINE_BATCH] for i in range(0, len(items), BASELINE_BATCH)]
+        now = iso(datetime.now(timezone.utc))
+        with ThreadPoolExecutor(BASELINE_WORKERS) as pool:
+            futures = {pool.submit(count_batch_ranges, gh, batch, org): batch for batch in batches}
+            for fut in as_completed(futures):
+                try:
+                    for m, counts in fut.result().items():
+                        a, b = todo[m]
+                        cache[m] = {"from": a.isoformat(), "to": b.isoformat(), "fetched_at": now, "counts": counts}
+                except GitHubError as exc:
+                    warn(f"similar tenure: a batch of {len(futures[fut])} member(s) failed and is left out ({exc})")
+        cache_path.write_text(json.dumps({"baseline_version": BASELINE_VERSION, "entries": cache}), encoding="utf-8")
+
+    def member_rates(m: str, created: datetime | None) -> dict | None:
+        first, _, days = tenure_window(created, start, end)
+        if first == start.date() and m in full_counts:
+            counts = full_counts[m]
+        else:
+            entry = cache.get(m)
+            if not entry:
+                return None
+            counts = entry["counts"]
+            days = max((date.fromisoformat(entry["to"]) - date.fromisoformat(entry["from"])).days, 1)
+        return {"active": counts["prs_opened"] + counts["prs_reviewed"] + counts["prs_commented"] > 0,
+                "days": days, "rates": as_rates(counts, days)}
+
+    for login, plan in plans.items():
+        person = people[login]
+        own = member_rates(login, ts(person["profile"].get("createdAt")))
+        rows = [r for r in (member_rates(m, ts(joined.get(m))) for m in plan["peers"]) if r]
+        active = [r for r in rows if r["active"]]
+        metrics = {}
+        for mdef in METRIC_DEFS:
+            key = mdef["key"]
+            if not mdef.get("org") or not own:
+                continue
+            values = sorted(r["rates"][key] for r in active if r["rates"].get(key) is not None)
+            value = own["rates"].get(key)
+            pct = percentile_rank(value, values)
+            metrics[key] = {
+                "value": value, "pct": pct,
+                "score": None if pct is None or not mdef["better"] else
+                         (pct if mdef["better"] == "up" else round(100 - pct, 1)),
+                "values": values,
+                "p25": quantile(values, 0.25), "median": quantile(values, 0.5), "p75": quantile(values, 0.75),
+                "p90": quantile(values, 0.9), "max": values[-1] if values else None,
+            }
+        person["tenure"] = {
+            "tenure_days": plan["tenure_days"], "range_days": plan["range_days"],
+            "low": TENURE_LOW, "high": TENURE_HIGH, "rate_days": RATE_DAYS,
+            "own_days": own["days"] if own else None,
+            "members": len(rows), "active_members": len(active), "metrics": metrics,
+        }
+        log(f"{login}: tenure {plan['tenure_days']} days -> {len(active)} active member(s) with "
+            f"{plan['range_days'][0]}-{plan['range_days'][1]} days", quiet=args.quiet)
+
+
 # --------------------------------------------------------------------------- #
 # output + viewer
 # --------------------------------------------------------------------------- #
@@ -1448,6 +1570,11 @@ def main(argv: list[str] | None = None) -> int:
                 log(f"{person['profile']['login']} joined on {person['comparison_since'].date()}: compared over "
                     f"the same {(end - person['comparison_since']).days} days only", quiet=args.quiet)
         windows = build_windows(gh, org, people, start, end, args)
+        if not args.no_baseline:
+            try:
+                tenure_compare(gh, org, people, start, end, args)
+            except GitHubError as exc:
+                error(f"similar-tenure comparison failed: {exc}")
     except GitHubError as exc:
         log(f"ERROR: {exc}")
         if DEBUG:
@@ -1471,7 +1598,7 @@ def main(argv: list[str] | None = None) -> int:
         "categories": pr_classify.category_defs(),
         "people": [{"login": l, "name": p["profile"].get("name"), "role": p["role"], "metrics": p["metrics"],
                     "counts": p["counts"], "ranks": p["ranks"], "group_scores": p["group_scores"],
-                    "comparison": p["comparison"]} for l, p in people.items()],
+                    "comparison": p["comparison"], "tenure": p.get("tenure")} for l, p in people.items()],
     })
     org_files = []
     for window in windows.values():
