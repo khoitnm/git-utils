@@ -73,6 +73,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import pr_classify  # noqa: E402 - needs the sys.path line above
+import tech_stack  # noqa: E402
 TEMPLATE = SCRIPT_DIR / "report_template.html"
 DEFAULT_REPORTS_DIR = SCRIPT_DIR.parent / "reports" / "github-performance"
 CACHE_DIR = SCRIPT_DIR / ".cache"
@@ -812,6 +813,77 @@ def fetch_person(gh: GitHub, login: str, org: str, start: datetime, end: datetim
     return person
 
 
+REPO_CACHE_DAYS = 7
+MANIFEST_MAX_CHARS = 300_000
+
+
+def fetch_repo_manifests(gh: GitHub, org: str, wanted: dict[str, list[str]], refresh: bool,
+                         quiet: bool) -> dict[str, dict[str, str]]:
+    """Text of the dependency manifests on each repo's default branch, cached per
+    repo and path for REPO_CACHE_DAYS: {repo: {path: text}}."""
+    cache_path = CACHE_DIR / f"repo_manifests_{org.lower()}.json"
+    cache: dict[str, dict] = {}
+    if cache_path.is_file() and not refresh:
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+    now = datetime.now(timezone.utc)
+
+    def fresh(repo: str, path: str) -> bool:
+        entry = (cache.get(repo) or {}).get(path)
+        return bool(entry) and now - ts(entry["fetched_at"]) < timedelta(days=REPO_CACHE_DAYS)
+
+    todo = {repo: [p for p in paths if not fresh(repo, p)] for repo, paths in wanted.items()}
+    todo = {repo: paths for repo, paths in todo.items() if paths}
+    if todo:
+        log(f"tech stack: reading dependency manifests of {len(todo)} repo(s)...", quiet=quiet)
+    items = list(todo.items())
+    for i in range(0, len(items), 4):
+        batch = items[i:i + 4]
+        parts = []
+        for r, (repo, paths) in enumerate(batch):
+            owner, name = repo.split("/", 1)
+            files = " ".join(f"m{j}: object(expression:{json.dumps('HEAD:' + p)}) {{ ... on Blob {{ text }} }}"
+                             for j, p in enumerate(paths))
+            parts.append(f"r{r}: repository(owner:{json.dumps(owner)}, name:{json.dumps(name)}) {{ {files} }}")
+        try:
+            data = gh.query("query { " + " ".join(parts) + " }")
+        except GitHubError as exc:
+            warn(f"tech stack: could not read manifests of {', '.join(r for r, _ in batch)} ({exc})")
+            continue
+        stamp = iso(now)
+        for r, (repo, paths) in enumerate(batch):
+            node = data.get(f"r{r}") or {}
+            entries = cache.setdefault(repo, {})
+            for j, p in enumerate(paths):
+                blob = node.get(f"m{j}") or {}
+                entries[p] = {"fetched_at": stamp, "text": (blob.get("text") or "")[:MANIFEST_MAX_CHARS]}
+    if todo:
+        CACHE_DIR.mkdir(exist_ok=True)
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    return {repo: {p: (cache.get(repo) or {}).get(p, {}).get("text", "") for p in paths}
+            for repo, paths in wanted.items()}
+
+
+def add_tech_stack(gh: GitHub, org: str, people: dict[str, dict], refresh: bool, quiet: bool) -> None:
+    """Languages / frameworks per area for every person (into work_mix["tech"])."""
+    repo_files: dict[str, set] = defaultdict(set)
+    for person in people.values():
+        for p in person["pull_requests"]:
+            repo_files[p["repository"]].update(f["path"] for f in p.get("files") or [])
+    wanted = {repo: tech_stack.manifest_paths(sorted(paths)) for repo, paths in repo_files.items() if repo}
+    try:
+        manifests = fetch_repo_manifests(gh, org, wanted, refresh, quiet)
+    except GitHubError as exc:
+        warn(f"tech stack: manifests unavailable, frameworks are left out ({exc})")
+        manifests = {}
+    repo_frameworks = {repo: tech_stack.frameworks_in(texts.values()) for repo, texts in manifests.items()}
+    for person in people.values():
+        person["series"]["work_mix"]["tech"] = tech_stack.summarize(
+            person["pull_requests"], person.pop("_reviewed", []), repo_frameworks)
+
+
 def person_from_store(store: dict, profile: dict, counts: dict, start: datetime, end: datetime) -> dict:
     """The window's slice of the stored raw data, with every PR classified afresh
     (so pr_classify.py changes apply without fetching again)."""
@@ -823,12 +895,15 @@ def person_from_store(store: dict, profile: dict, counts: dict, start: datetime,
     prs.sort(key=lambda p: p["createdAt"], reverse=True)
     commits = sorted((c for c in store["commits"] if c.get("date") and start <= ts(c["date"]) <= end),
                      key=lambda c: c["date"], reverse=True)
+    reviews = review_rows(store["reviewed_prs"], start, end)
+    reviewed_urls = {r["pr_url"] for r in reviews}
     return {
+        "_reviewed": [pr for pr in store["reviewed_prs"] if pr["url"] in reviewed_urls],
         "data_version": DATA_VERSION,
         "profile": profile,
         "counts": counts,
         "pull_requests": prs,
-        "reviews": review_rows(store["reviewed_prs"], start, end),
+        "reviews": reviews,
         "commits": commits,
     }
 
@@ -1668,6 +1743,7 @@ def main(argv: list[str] | None = None) -> int:
             if person["comparison_since"] != start:
                 log(f"{person['profile']['login']} joined on {person['comparison_since'].date()}: compared over "
                     f"the same {(end - person['comparison_since']).days} days only", quiet=args.quiet)
+        add_tech_stack(gh, org, people, args.refresh_data, args.quiet)
         windows = build_windows(gh, org, people, start, end, args)
         if not args.no_baseline:
             try:
@@ -1687,6 +1763,7 @@ def main(argv: list[str] | None = None) -> int:
     people_index = []
     for login, person in people.items():
         person.pop("comparison_since", None)
+        person.pop("_reviewed", None)
         name = f"users/{safe_name(login)}.json"
         write_json(data_dir / name, person)
         people_index.append({"login": login, "name": person["profile"].get("name"), "role": person["role"],

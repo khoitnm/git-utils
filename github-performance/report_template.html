@@ -324,6 +324,8 @@ const COLUMN_TIPS = {
   "Score": "The percentile turned so that 100 is always the good end. Above 50 = better than typical, below 50 = worse. Blank = context-only metric.",
   "Direction": "Whether higher or lower is better. 'Context only' = neither; read it together with other numbers.",
   // work mix
+  "Languages": "Programming and file languages in this area, as a share of its changed lines. Hover one for lines and files.",
+  "Frameworks & tools": "Frameworks, libraries and tools used where they worked in this area. The number = how many of their PRs it applies to. Hover for where it was found.",
   "Area": "Part of the system a PR mainly changes. Bold = top-level area (Backend, Frontend...), indented = its parts. A PR counts once, in the part with most of its real changes (tests, config and docs give way to code).",
   "Change type": "Why the PR was made, from its title, branch or files.",
   "PRs (main area)": "PRs whose main area is this one, and their share of all PRs. Each PR is counted once.",
@@ -451,6 +453,9 @@ function renderCaveat() {
         even when there is a number for it: design and architecture, mentoring, unblocking others, incident and on-call work,
         requirements and JIRA work, the difficulty and impact of a change, and how much rework it saves later.
         Volume metrics (PRs, commits, lines) are easy to inflate and say nothing about quality.</li>
+      <li><b>They say nothing about a person's character.</b> Teamwork, curiosity, listening, presentation, transparency,
+        open-mindedness, adaptability and many other qualities that make someone valuable to a team cannot be seen in
+        GitHub activity at all.</li>
       <li><b>What the numbers mean will change over time.</b> For example, review counts and review comments mean something
         different once people use AI to generate review comments automatically. Approval counts mean something different
         in teams that let members approve and merge their own PRs, or that don't require approval at all. Compare people
@@ -662,6 +667,22 @@ function heatTable(rows, cols, rowKey, rowLabel, colLabel) {
     </tbody></table></div>`;
 }
 
+// Languages and frameworks per area (parents in bold, their parts below)
+function techTable(tech) {
+  if (!tech) return "";
+  const langs = r => r.languages.filter(l => l.share >= 0.02 || r.languages.length <= 3).slice(0, 5).map(l =>
+    `<span data-tip="${esc(`${l.name}: ${Math.round(100 * l.share)}% of the changed lines in ${r.label}\n${fmt(l.lines)} lines in ${fmt(l.files)} file change(s)`)}">${esc(l.name)} <span class="muted">${Math.round(100 * l.share)}%</span></span>`).join(" · ");
+  const fws = r => r.frameworks.length ? r.frameworks.slice(0, r.level ? 6 : 12).map(f =>
+    `<span class="chip" style="margin:0 4px 3px 0" data-tip="${esc(`${f.name}: used in ${f.prs} of their PRs in ${r.label}\n${f.source === "files" ? "Seen in the files they changed." : "Listed in the dependency manifest (pom.xml, package.json...) of a repo where they changed " + r.label + " files."}`)}">${esc(f.name)} ${f.prs}</span>`).join("") : '<span class="muted">–</span>';
+  return `<h3 class="chart-title" style="margin-top:18px">Languages &amp; frameworks by area</h3>
+    <p class="sub" style="margin-bottom:6px">Languages = share of the changed lines in that area. Frameworks and tools = from the repositories' dependency manifests and from
+      the changed files, counted in the PRs where they apply (the number is PRs). A framework shows only where the person worked in that part of a repo that uses it.</p>
+    <div class="scroll"><table><thead><tr><th class="l">Area</th><th class="l">Languages</th><th class="l">Frameworks &amp; tools</th></tr></thead><tbody>
+    ${tech.by_area.map(r => `<tr class="${r.level ? "child-row" : "parent-row"}"><td class="l" data-tip="${esc(catDesc("areas", r.area))}">${r.level ? '<span class="muted">└ </span>' : ""}${esc(r.label)}</td>
+      <td class="wrap">${langs(r)}</td><td class="wrap" style="max-width:640px">${fws(r)}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+
 function renderMix(el, login) {
   const u = state.users[login], w = u.series.work_mix, p = state.summary.people.find(x => x.login === login);
   if (!w) { el.innerHTML = `<h2>What kind of work</h2><p class="empty">This report was generated before PR classification existed.</p>`; return; }
@@ -689,6 +710,7 @@ function renderMix(el, login) {
     ${mixTable(w.areas, "areas", "area", total,
       `<th>Touched by</th><th>Line share</th>`,
       r => `<td>${fmt(r.prs_touching)}</td><td>${Math.round(100 * r.line_share)}%</td>`)}
+    ${techTable(w.tech)}
     <h3 class="chart-title" style="margin-top:18px">By change type</h3>
     ${mixTable(w.types, "types", "type", total)}
     <div class="grid2" style="margin-top:18px">
@@ -696,10 +718,15 @@ function renderMix(el, login) {
       <div><h3 class="chart-title">Change type × area (PRs)</h3>${heatTable(crossRows, topAreas, "type", "Type \\ area", a => a)}</div>
       <div><h3 class="chart-title">Most-changed directories (lines)</h3><div id="mix-dirs"></div></div>
       <div><h3 class="chart-title" data-tip="Every changed file in their PRs, by extension. Includes test, config and docs files: hover a bar to see which areas they belong to.">File types changed (number of files, incl. tests)</h3><div id="mix-ext"></div></div>
+      <div><h3 class="chart-title" data-tip="All files changed in their PRs, by language, weighted by changed lines (lock and generated files count as a few lines).">Languages they change (share of lines)</h3><div id="mix-langs"></div></div>
+      <div><h3 class="chart-title" data-tip="Languages of the PRs they reviewed, weighted by the lines in those PRs. Shows which codebases they can review.">Languages of the PRs they review</h3><div id="mix-rev-langs"></div></div>
       <div><h3 class="chart-title">Areas of the PRs they review (${reviewedTotal} PRs)</h3><div id="mix-rev-areas"></div></div>
       <div><h3 class="chart-title">Kinds of PRs they review</h3><div id="mix-rev-types"></div></div>
     </div>`;
   hbars($("#mix-dirs", el), w.top_dirs, { label: r => r.dir, value: r => r.lines, tipFn: r => `${r.dir}\n${fmt(r.lines)} lines in ${r.prs} PR(s)` });
+  const langTip = r => `${r.name}: ${Math.round(100 * r.share)}% of changed lines\n${fmt(r.lines)} lines in ${fmt(r.files)} file change(s)`;
+  hbars($("#mix-langs", el), w.tech?.languages || [], { label: r => r.name, value: r => r.share, unit: "pct", tipFn: langTip, max: 1 });
+  hbars($("#mix-rev-langs", el), w.tech?.review_languages || [], { label: r => r.name, value: r => r.share, unit: "pct", tipFn: langTip, max: 1 });
   hbars($("#mix-ext", el), w.file_types, { label: r => r.ext, value: r => r.files,
     tipFn: r => `${r.ext}: ${r.files} file change(s)\n` + Object.entries(r.areas || {}).map(([a, n]) => `${a}: ${n}`).join("\n") });
   hbars($("#mix-rev-areas", el), w.review_areas, { label: r => r.area, value: r => r.prs,

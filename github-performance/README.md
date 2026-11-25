@@ -82,25 +82,49 @@ Every metric also has a short "how to read it" line (`METRIC_READ`) that says wh
 good, bad or only context. In the report, hovering a metric shows its definition and that
 line, and hovering any table column header shows what the column means.
 
-## What kind of work (`pr_classify.py`)
+## What kind of work (`pr_classify.py`, `tech_stack.py`)
 
 Every PR is classified twice, by rules you can tune in `pr_classify.py`:
 
-* **Area**, from its changed files. Each file goes to the first matching area: AI & agent
-  tooling, Dependencies & build, CI/CD pipelines, Scheduled jobs, Infrastructure, Database,
-  Tests, APIs, Docs, Support tools & scripts, Frontend, Configuration, Backend. The PR's main
-  area is the one with the most changed lines. Lock files count as only a few lines, and
-  tests, docs and config give way to any real code area that has at least 10% of the lines.
+* **Area**, from its changed files, as a parent and its parts:
+
+  | Parent | Parts |
+  |---|---|
+  | Backend | Core logic, APIs, Scheduled jobs, Database, Configuration, Tests |
+  | Frontend | UI code, Configuration, Tests |
+  | Infrastructure & delivery | Infrastructure, CI/CD pipelines |
+  | Dependencies & build | (manifests, lock files, build-tool versions) |
+  | Developer tooling | AI & agent tooling, Support tools & scripts |
+  | Docs & other | Docs, Other |
+
+  Tests and configuration go to Backend or Frontend by file and repository (`.java` tests,
+  `application.yml` to Backend; `.spec.tsx`, Cypress, UI-repo config to Frontend). A PR's main
+  parent is where its real changes are: tests, config and docs decide only when nothing else
+  reaches 10% of the changed lines. Lock files count as only a few lines.
 * **Change type**, from a conventional-commit prefix, then the title, then the branch name,
   then the files: Feature, Enhancement, Bug fix, Performance, Refactor & cleanup,
   Dependency & platform upgrade, Tooling & AI, Tests, Docs, CI/CD & build, Configuration,
   Release & merge, Revert, Product change.
 
-The report shows, per area and per type: PRs, PRs touching the area, line share, merged,
-lines added / deleted, median size, median time to merge, repos, and share with tests. It
-also shows area by month, type × area, the most-changed directories, file types, and the
-areas and types of the PRs the person reviews. GitHub returns the first 100 files of a PR
-(60 for reviewed PRs), so very large PRs are classified from those.
+The report shows, per parent and part, and per change type: PRs, PRs touching it, line share,
+merged, lines added / deleted, median size, median time to merge, repos, share with tests.
+It also shows area by month, type × area, the most-changed directories, file types, and the
+areas and types of the PRs the person reviews.
+
+**Languages & frameworks** (`tech_stack.py`), per parent and part:
+
+* languages from file extensions, as a share of changed lines (also for the PRs they review);
+* tools seen in the changed files (Docker, Helm, GitHub Actions, Jenkins, Liquibase, Cypress,
+  Claude Code, Copilot...);
+* frameworks and libraries from the dependency manifests (`pom.xml`, `build.gradle`,
+  `package.json`, `requirements.txt`...) at the root and at the top of the folders the
+  person changed most, read from GitHub and cached for 7 days in
+  `.cache/repo_manifests_<org>.json`. A framework is credited to an area only when the person
+  changed that area's files in a repository that uses it, and the number shown is how many
+  of their PRs it applies to.
+
+GitHub returns the first 100 files of a PR (60 for reviewed PRs), so very large PRs are
+classified from those.
 
 ## Stored data and versions
 
@@ -159,6 +183,9 @@ Every report opens with this note:
   measured correctly, even when there is a number for it: design, mentoring, unblocking
   others, incidents and on-call, JIRA and requirements work, and the difficulty and impact of
   a change. Volume metrics (PRs, commits, lines) are easy to inflate.
+* **They say nothing about a person's character**: teamwork, curiosity, listening,
+  presentation, transparency, open-mindedness, adaptability and many other important
+  qualities can't be seen in GitHub activity.
 * **What the numbers mean will change over time.** Review counts and comments mean
   something different once AI generates review comments. Approval counts mean something
   different in teams that let people approve and merge their own PRs, or need no approval.
