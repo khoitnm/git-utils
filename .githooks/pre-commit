@@ -1,0 +1,4 @@
+#!/bin/sh
+# Blocks a commit that would publish org- or project-specific content.
+# Enable once per clone:  git config core.hooksPath .githooks
+exec python scripts/check_portability.py

@@ -1,4 +1,4 @@
-# github-performance
+# members-activities-on-git
 
 Analyse one or more people's GitHub activity over the last year inside the company
 organisation, compare them with their peers and with everyone else in the org, and
@@ -8,11 +8,11 @@ open the result as an HTML report in the browser.
 pip install -r requirements.txt
 cp .env.example .env          # set GITHUB_ORG and GITHUB_USERS
 
-python github_performance.py                                   # people from GITHUB_USERS
-python github_performance.py https://github.com/<login> <login2>,<login3>
-python github_performance.py --users-file people.txt --team <team-slug>
-python github_performance.py <login> --peers <a>,<b> --days 180
-python github_performance.py --view ../reports/github-performance/<stamp>   # re-open a report
+python members-activities-on-git.py                                   # people from GITHUB_USERS
+python members-activities-on-git.py https://github.com/<login> <login2>,<login3>
+python members-activities-on-git.py --users-file people.txt --team <team-slug>
+python members-activities-on-git.py <login> --peers <a>,<b> --days 180
+python members-activities-on-git.py --view ../reports/members-activities-on-git/<stamp>   # re-open a report
 ```
 
 Authentication: the script tries these sources in order and uses the first one GitHub accepts:
@@ -157,7 +157,7 @@ in `manifest.json` → `run_cost`.
 ## Output
 
 ```
-reports/github-performance/<stamp>_v<DATA_VERSION>/      (gitignored)
+reports/members-activities-on-git/<stamp>_v<DATA_VERSION>/      (gitignored)
   index.html                 copy of report_template.html
   data/manifest.json         window, people, files, problems
   data/summary.json          metric definitions, metrics, ranks, scores for everyone

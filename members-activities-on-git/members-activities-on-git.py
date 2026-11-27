@@ -3,9 +3,9 @@
 
 Give it one or more people, as profile links or plain logins:
 
-  python github_performance.py https://github.com/<login> <login2>,<login3>
-  python github_performance.py --users-file people.txt --team my-team
-  python github_performance.py                  # people from GITHUB_USERS in .env
+  python members-activities-on-git.py https://github.com/<login> <login2>,<login3>
+  python members-activities-on-git.py --users-file people.txt --team my-team
+  python members-activities-on-git.py                  # people from GITHUB_USERS in .env
 
 For each person it pulls, inside the company organisation and for the window
 (default: the last 365 days):
@@ -30,7 +30,7 @@ consistency metrics and ranks every person against two populations:
     --baseline-sample of them), cached for a week, so the headline numbers get a
     company-wide percentile. Members with no PR activity at all are left out.
 
-Raw data lands as JSON in reports/github-performance/<stamp>/data, next to a copy
+Raw data lands as JSON in reports/members-activities-on-git/<stamp>/data, next to a copy
 of report_template.html, and the report opens in the browser through a small
 local web server (Ctrl+C stops it). Re-open an old report with --view <dir>.
 
@@ -75,7 +75,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import pr_classify  # noqa: E402 - needs the sys.path line above
 import tech_stack  # noqa: E402
 TEMPLATE = SCRIPT_DIR / "report_template.html"
-DEFAULT_REPORTS_DIR = SCRIPT_DIR.parent / "reports" / "github-performance"
+DEFAULT_REPORTS_DIR = SCRIPT_DIR.parent / "reports" / "members-activities-on-git"
 CACHE_DIR = SCRIPT_DIR / ".cache"
 API = "https://api.github.com"
 
@@ -250,7 +250,7 @@ class GitHub:
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"bearer {token}",
                                      "Accept": "application/vnd.github+json",
-                                     "User-Agent": "github-performance-report"})
+                                     "User-Agent": "members-activities-on-git"})
         self.calls = 0
         self.lock = threading.Lock()
 

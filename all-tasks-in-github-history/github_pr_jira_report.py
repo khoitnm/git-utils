@@ -552,7 +552,7 @@ class JiraClient:
                             f"(HTTP {response.status_code}, not JSON): every ticket "
                             f"would come back blank",
                             hint="JIRA_BASE_URL must be the base of the REST API, e.g. "
-                                 "https://jira.example.com/jira")
+                                 "https://<your-jira-host>/jira")
                 return False
         if response is None:
             return False
@@ -951,7 +951,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=[], metavar="NAMES",
                         help="git author names, emails or fragments - one person often has "
                              "several. Comma-separated and repeatable, e.g. "
-                             "--authors jdoe,'Jane Doe',jane.doe@corp.com "
+                             "--authors jdoe,'Jane Doe',jane.doe@example.com "
                              "(default: this clone's user.email)")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help="look-back window in days")
     parser.add_argument("--branch", default="",

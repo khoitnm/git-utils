@@ -5,7 +5,7 @@
   Cypress, Claude Code...) come from the changed files themselves.
 * Frameworks and libraries (Spring Boot, React, JUnit, Kafka...) come from the
   dependency manifests of the repositories (pom.xml, package.json, build.gradle,
-  requirements.txt...), read by github_performance.py.
+  requirements.txt...), read by members-activities-on-git.py.
 
 A framework is credited to an area only when the person changed files of that
 area in a repository that uses it: React counts for their Frontend work only if
@@ -200,7 +200,7 @@ MAX_MANIFESTS_PER_REPO = 40
 def manifest_paths(repo_files: Iterable[str]) -> list[str]:
     """Where to look for dependency manifests in one repository: the root, the
     manifests the person changed, and the top of the folders they changed most
-    (monorepos keep each module's manifest there: sc-app/package.json)."""
+    (monorepos keep each module's manifest there: web-app/package.json)."""
     files = list(repo_files)
     seen = list(ROOT_MANIFESTS)
     for path in files:

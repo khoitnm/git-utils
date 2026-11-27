@@ -3,7 +3,7 @@
 
 Both are rule lists checked top to bottom, first match wins, so the order is the
 priority: a test file under src/main/java/.../controller is a test, not an API.
-Tune the regexes here; github_performance.py only calls classify_pr().
+Tune the regexes here; members-activities-on-git.py only calls classify_pr().
 """
 
 from __future__ import annotations

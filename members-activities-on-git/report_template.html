@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GitHub performance report</title>
+<title>Members' activities on Git</title>
 <!--
-  Template for github_performance.py. It is copied next to the JSON it renders:
+  Template for members-activities-on-git.py. It is copied next to the JSON it renders:
     data/manifest.json      - what the run contains
     data/summary.json       - metric definitions, every person's metrics, ranks and scores
     data/org_baseline*.json - anonymous org-wide distributions, one per comparison window (optional)
     data/users/<login>.json - raw per-person data: PRs, reviews, commits, calendar, chart series
   Browsers block fetch() from file://, so open it through the script's local server
-  (python github_performance.py --view <report folder>).
+  (python members-activities-on-git.py --view <report folder>).
 -->
 <style>
 .viz-root {
@@ -159,7 +159,7 @@ input[type=search] { font: inherit; padding: 5px 10px; border: 1px solid var(--b
 </head>
 <body class="viz-root">
 <header class="top">
-  <h1>GitHub performance</h1>
+  <h1>Members' activities on Git</h1>
   <span class="meta" id="meta">loading...</span>
   <span class="spacer"></span>
   <label>Person <select id="person-select"></select></label>
@@ -844,7 +844,7 @@ async function load() {
   } catch (err) {
     $("#app").innerHTML = `<section class="card"><h2>Could not load the report data</h2>
       <p>${esc(err.message)}</p><p class="sub">The data file <code>data/report-data.js</code> next to this page is missing or unreadable (reports made before it existed
-      do not have it). Run <code>python github_performance.py --view &lt;this folder&gt;</code> once: it adds the file, after which this
+      do not have it). Run <code>python members-activities-on-git.py --view &lt;this folder&gt;</code> once: it adds the file, after which this
       page also opens straight from disk.</p></section>`;
     $("#meta").textContent = "";
     return;

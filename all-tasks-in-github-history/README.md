@@ -67,7 +67,7 @@ From the `.env` in the repo root (already git-ignored). No GitHub token needed.
 | Variable | Used for |
 | --- | --- |
 | `JIRA_PAT` | Jira ticket summary / status / type. Optional (`--no-jira`). |
-| `JIRA_BASE_URL` | The base of the Jira **REST API**, including any context path, e.g. `https://jira.pointclickcare.com/jira`. Also builds the `…/browse/KEY-1` links. |
+| `JIRA_BASE_URL` | The base of the Jira **REST API**, including any context path, e.g. `https://<your-jira-host>/jira`. Also builds the `…/browse/KEY-1` links. |
 | `JIRA_EMAIL` | Only for Atlassian **Cloud** (email + API token). Leave unset for Jira Server/DC PATs. |
 | `ANTHROPIC_API_KEY` | Only for `--summarizer anthropic`. |
 

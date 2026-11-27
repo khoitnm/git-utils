@@ -35,5 +35,8 @@ out/
 reports/
 /.claude/settings.json
 
-# github-performance baseline cache
+# members-activities-on-git cache
 .cache/
+
+# private names for scripts/check_portability.py
+.skill-lint-private-terms
